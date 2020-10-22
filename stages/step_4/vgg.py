@@ -10,11 +10,11 @@ from typing import Union, Optional
 from dataclasses import dataclass, field, InitVar
 from urllib.request import urlopen
 
-from torch import Tensor, no_grad, max as torch_max, load as load_model
-from torch.nn import Module, Linear
-from torch.nn.functional import cross_entropy
-from torch.optim import Optimizer, Adam
-from torch.utils.data import DataLoader, Dataset, ConcatDataset
+from torch import Tensor, no_grad, max as torch_max, load as load_model  # type: ignore
+from torch.nn import Module, Linear  # type: ignore
+from torch.nn.functional import cross_entropy  # type: ignore
+from torch.optim import Optimizer, Adam  # type: ignore
+from torch.utils.data import DataLoader, Dataset, ConcatDataset  # type: ignore
 from torchvision.datasets import ImageFolder, FashionMNIST  # type: ignore
 from torchvision.transforms import ToTensor, Compose, Resize, RandomHorizontalFlip, RandomResizedCrop, Normalize  # type: ignore
 from torchvision.models import vgg16 as vgg  # type: ignore
