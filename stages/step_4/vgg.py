@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, InitVar
 from urllib.request import urlopen
 
 from torch import Tensor, no_grad, max as torch_max, load as load_model  # type: ignore
-from torch.nn import Module, Linear  # type: ignore
+from torch.nn import Module, Linear, Conv2d  # type: ignore
 from torch.nn.functional import cross_entropy  # type: ignore
 from torch.optim import Optimizer, Adam  # type: ignore
 from torch.utils.data import DataLoader, Dataset, ConcatDataset  # type: ignore
@@ -47,13 +47,22 @@ class TrainStats:
 
 
 class CustomVGG(Module):
-    def __init__(self, pretrained: bool = False, out_classes: Optional['int'] = None, classifier: Optional['Module'] = None):
+    def __init__(
+        self,
+        pretrained: bool = False,
+        input_channel: Optional[int] = None,
+        out_classes: Optional['int'] = None,
+        classifier: Optional['Module'] = None
+    ):
         super().__init__()
         model = vgg(pretrained=pretrained, progress=True)
 
         if pretrained:
             for layer_param in model.parameters():
                 layer_param.requires_grad = False
+
+        if input_channel:
+            model.features[0] = Conv2d(input_channel, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
         if classifier:
             model.classifier = classifier
         if out_classes:
@@ -211,12 +220,14 @@ class DatasetUtils:
                     show_image( X.cpu().data[j] )
 
     @staticmethod
-    def get_mnist_dataset(save_dir: str, transform: Optional['Compose'] = None, is_train: bool = True) -> 'Dataset':
+    def get_mnist_dataset(save_dir: str, is_train: bool = True, transform: Optional['Compose'] = None) -> 'Dataset':
         return FashionMNIST(
             root=save_dir,
             train=is_train,
             download=True,
-            transform=transform
+            transform=transform if transform else Compose([
+                ToTensor()
+            ])
         )
 
     @staticmethod
@@ -253,40 +264,66 @@ class DatasetUtils:
 
 
 
+class ModelsTests:
+    @staticmethod
+    def test_hymenoptera():
+        dataset = DatasetUtils.get_external_dataset(
+            'https://download.pytorch.org/tutorial/hymenoptera_data.zip',
+            './datasets',
+            'hymenoptera_data/train',
+            Compose([
+                RandomHorizontalFlip(),
+                Resize([128, 128]),
+                ToTensor(),
+                Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+        )
+        aug_dataset = DatasetUtils.multiply_dataset(
+            './datasets/hymenoptera_data/train',
+            Compose([
+                RandomResizedCrop(224),
+                RandomHorizontalFlip(),
+                Resize([128, 128]),
+                ToTensor(),
+                Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+            n_count=3
+        )
+
+        train_params = TrainParams(epochs=10, lr=0.005, accuracy_threshold=0.9)
+        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
+
+        model = CustomVGG(pretrained=True, input_channel=1, out_classes=2)
+        start_optimizer = Adam(model.parameters(), lr=train_params.lr, amsgrad=True)
+
+        Processing.train_model(ConcatDataset([dataset, aug_dataset]), train_params, train_loader_params, model, start_optimizer)
+
+
+    @staticmethod
+    def test_fmnist():
+        dataset = DatasetUtils.get_mnist_dataset(
+            './datasets/FashionMNIST_TRAIN',
+            is_train=True,
+            transform=Compose([
+                Resize([64, 64]),
+                ToTensor()
+            ])
+        )
+
+        train_params = TrainParams(epochs=10, lr=0.005, accuracy_threshold=0.9)
+        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
+
+        model = CustomVGG(pretrained=True, input_channel=1, out_classes=10)
+        start_optimizer = Adam(model.parameters(), lr=train_params.lr, amsgrad=True)
+
+        Processing.train_model(dataset, train_params, train_loader_params, model, start_optimizer)
+
+
+
 
 def main():
-    dataset = DatasetUtils.get_external_dataset(
-        'https://download.pytorch.org/tutorial/hymenoptera_data.zip',
-        './datasets',
-        'hymenoptera_data/train',
-        Compose([
-            RandomHorizontalFlip(),
-            Resize([128, 128]),
-            ToTensor(),
-            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-    )
-    aug_dataset = DatasetUtils.multiply_dataset(
-        './datasets/hymenoptera_data/train',
-        Compose([
-            RandomResizedCrop(224),
-            RandomHorizontalFlip(),
-            Resize([128, 128]),
-            ToTensor(),
-            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ]),
-        n_count=3
-    )
-
-    train_params = TrainParams(epochs=10, lr=0.005, accuracy_threshold=0.9)
-    train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
-
-    model = CustomVGG(pretrained=True, out_classes=2)
-    start_optimizer = Adam(model.parameters(), lr=train_params.lr, amsgrad=True)
-
-    Processing.train_model(ConcatDataset([dataset, aug_dataset]), train_params, train_loader_params, model, start_optimizer)
-
-
+    ModelsTests.test_hymenoptera()
+    # ModelsTests.test_fmnist()
 
 
 
