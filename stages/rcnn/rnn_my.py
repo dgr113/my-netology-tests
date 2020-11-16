@@ -3,18 +3,21 @@
 import pandas as pd
 
 from pathlib import Path
+from functools import partial
 from itertools import starmap
-from typing import Union, Tuple, Sequence, Optional
+from typing import Union, Tuple, Sequence, Optional, Dict
 from dataclasses import dataclass, field, InitVar
 
 from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max, from_numpy as torch_from_numpy  # type: ignore
 from torch.nn import Module, Linear, RNN, Embedding  # type: ignore
-from torch.nn.functional import cross_entropy  # type: ignore
+from torch.nn.functional import cross_entropy, softmax  # type: ignore
 from torch.optim import Optimizer, Adam  # type: ignore
 from torch.utils.data import DataLoader, Dataset  # type: ignore
 
 
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GPU
+
+UNI_CHARS_TYPE = Union[str, Sequence[str]]
 _2D_INT_ARRAY = Sequence[Sequence[int]]
 
 
@@ -45,27 +48,35 @@ class TrainStats:
 
 
 class CustomTextDataset(Dataset):
-    def __init__(self, csv_file: Union['Path', str], data_col: str, norm_doc_len: int = 50, vocab: Sequence[str] = 'abcdefghijklmnopqrstuvwxyz '):
-        self.voc_size = len(vocab) + 1  # additional (first) alphabet value for non-found characters
-        self.char_to_ind = { w: i for i, w in enumerate(set(vocab), start=1) }
-        self.ind_to_char = { i: w for w, i in self.char_to_ind.items() }
-        self._init_data(
-            pd.read_csv(csv_file)[data_col].fillna(''),
-            norm_doc_len
-        )
+    def __init__(self, csv_file: Union['Path', str], data_col: str, char2int: Dict[str, int], norm_doc_len: int = 50):
+        data = pd.read_csv(csv_file)[data_col].fillna('')
+        self._data = CustomTextDataset.get_tensor_data(data, char2int, norm_doc_len)
+
+    @staticmethod
+    def get_char_ind_map(vocab: Sequence[str]) -> Tuple[Dict[str, int], Dict[int, str]]:
+        char2int = { w: i for i, w in enumerate(vocab, start=1) }
+        int2char = { i: w for w, i in char2int.items() }
+        return char2int, int2char
+
+    @staticmethod
+    def get_tensor_data(text_corpus: Sequence[str], char_to_ind: Dict[str, int], doc_len: int = 50) -> 'Tensor':
+        """ Set inner data as Tensor form """
+        if not isinstance(text_corpus, pd.Series):
+            text_corpus = pd.Series(text_corpus)
+
+        apply_func = partial(CustomTextDataset.get_char_ind, char_to_ind)
+
+        data = CustomTextDataset._extend_rows(text_corpus, doc_len).applymap( apply_func ).values
+        return torch_from_numpy(data)
 
     @staticmethod
     def _extend_rows(s: 'pd.Series', doc_len: int) -> 'pd.DataFrame':
         """ Extend every string row into new columns by one char """
         return s.str[:doc_len].str.split('', expand=True).iloc[:, 1:-1]
 
-    def _get_char_ind(self, ch: str) -> int:
-        return self.char_to_ind.get(ch, 0)
-
-    def _init_data(self, text_corpus: 'pd.Series', doc_len: int) -> None:
-        """ Set inner data as Tensor form """
-        data = CustomTextDataset._extend_rows(text_corpus, doc_len).applymap(self._get_char_ind).values
-        self._data = torch_from_numpy(data)
+    @staticmethod
+    def get_char_ind(char_to_ind_map: Dict[str, int], ch: str) -> int:
+        return char_to_ind_map.get(ch, 0)
 
     def __len__(self):
         return len(self._data)
@@ -127,15 +138,21 @@ class TrainContext:
             self._epoch_start()
 
             hidden = None
+            train_loss = 0
+            train_passed = 0
+
             for X_batch, y_batch in Processing.loader_to_device(self._data):
                 X_predicted, hidden = self.model(X_batch, hidden)
 
                 loss = cross_entropy(X_predicted.view(-1, 28), y_batch.flatten())
+                train_loss += loss.item()
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                train_passed += 1
 
+            print( "Train loss: {:.3f}".format(train_loss / train_passed) )
             epoch_stats = self._get_epoch_stats()
             return epoch_stats
         else:
@@ -183,10 +200,12 @@ class Processing:
     @staticmethod
     def train_model(dataset: 'Dataset', train_params: 'TrainParams', loader_params: 'DataLoaderParams', model: 'Module', optimizer: 'Optimizer') -> None:
         for epoch_stats in TrainContext(dataset, train_params, loader_params, model, optimizer):
-            print( "Epoch train stats: {}".format(epoch_stats) )
+            # print( "Epoch train stats: {}".format(epoch_stats) )
+            pass
 
     @staticmethod
     def test_model(dataset: 'Dataset', loader_params: 'DataLoaderParams', model: 'Module') -> float:
+        model.train()
         total, correct = 0, 0
         with no_grad():
             for images, labels in Processing.loader_to_device(DataLoader(dataset, batch_size=loader_params.batch_size, shuffle=loader_params.batch_shuffle)):
@@ -201,8 +220,33 @@ class Processing:
 
 
     @staticmethod
-    def predict(model, character):
-        pass
+    def _predict_step(int2char: Dict[int, str], outputs: 'Tensor') -> str:
+        outputs = outputs[-1]  # Get last doc, because there's only one of them
+
+        # print(outputs.shape)  # [1, 5, 28] - 1 документ, 5 символов, 28 вероятностей следующег осимвола для каждого класса
+        prob = softmax(outputs, dim=0).data
+        _, result = torch_max(prob, dim=0)
+
+        predicted_ind = int(result[1].item())
+        predicted_char = int2char.get(predicted_ind, ' ')
+        return predicted_char
+
+
+    @staticmethod
+    def predict(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: UNI_CHARS_TYPE) -> None:
+        model.eval()
+
+        with no_grad():
+            for i in range(30):
+                X = CustomTextDataset.get_tensor_data(chars, char2int)
+                outputs, _ = model(X)
+                print("!!!", X, '\r\n')
+                predicted_char = Processing._predict_step(int2char, outputs)
+                chars += predicted_char
+
+            result = ''.join(chars)
+            print('Predicted: ', result)
+
 
 
 
@@ -210,15 +254,22 @@ class Processing:
 class ModelsTests:
     train_params: 'TrainParams' = TrainParams(epochs=10, lr=0.002)
 
-    def test_one(self):
-        train_dataset = CustomTextDataset('./data/data.csv', 'normalized_text')
 
-        model = CustomRNN(train_dataset.voc_size, train_dataset.voc_size).to(TORCH_DEVICE)
+    def test_one(self):
+        vocab = 'abcdefghijklmnopqrstuvwxyz '
+        char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
+        vocab_size = len(vocab) + 1
+
+        train_dataset = CustomTextDataset('./data/data.csv', 'normalized_text', char2int)
+
+        model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
 
         train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
         Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
-        # Processing.test_model(test_dataset, test_loader_params, model)
+
+        Processing.predict(model, int2char, char2int, 'maggie')
+
 
 
 

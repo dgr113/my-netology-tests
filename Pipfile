@@ -10,6 +10,9 @@ matplotlib = "*"
 albumentations = "*"
 jupyter = "*"
 pandas = "*"
+keras = "*"
+sequential = "*"
+tensorflow = "*"
 
 [requires]
 python_version = "3.8"
