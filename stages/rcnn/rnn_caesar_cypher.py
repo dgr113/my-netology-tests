@@ -4,7 +4,8 @@ import pandas as pd
 
 from functools import partial
 from itertools import starmap
-from typing import Union, Tuple, Sequence, Optional, Dict
+from string import ascii_lowercase
+from typing import Union, Tuple, Sequence, Optional, Dict, Callable
 from dataclasses import dataclass, field, InitVar
 
 from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max, from_numpy as torch_from_numpy  # type: ignore
@@ -17,6 +18,7 @@ TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GP
 
 UNI_CHARS_TYPE = Union[str, Sequence[str]]
 _2D_INT_ARRAY = Sequence[Sequence[int]]
+DATA_TRANSFORM_FUNC = Callable[['Tensor'], Tuple['Tensor', 'Tensor']]
 
 
 
@@ -46,7 +48,14 @@ class TrainStats:
 
 
 class CustomTextDataset(Dataset):
-    def __init__(self, data: Sequence[str], char2int: Dict[str, int], norm_doc_len: int = 50):
+    def __init__(
+        self,
+        data: Sequence[str],
+        char2int: Dict[str, int],
+        norm_doc_len: int = 50,
+        *, transform_func: Optional[DATA_TRANSFORM_FUNC] = None
+    ):
+        self.transform_func = transform_func
         self._data = CustomTextDataset.get_tensor_data(data, char2int, norm_doc_len)
 
     @staticmethod
@@ -61,26 +70,25 @@ class CustomTextDataset(Dataset):
         if not isinstance(text_corpus, pd.Series):
             text_corpus = pd.Series(text_corpus)
 
-        apply_func = partial(CustomTextDataset.get_char_ind, char_to_ind)
+        apply_func = partial(CustomTextDataset._get_char_ind, char_to_ind)
         data = CustomTextDataset._extend_rows(text_corpus, doc_len).applymap( apply_func ).values
         return torch_from_numpy(data)
 
-    # noinspection PyTypeChecker
+    @staticmethod
+    def _get_char_ind(char_to_ind_map: Dict[str, int], ch: str) -> int:
+        return char_to_ind_map.get(ch, 0)
+
     @staticmethod
     def _extend_rows(s: 'pd.Series', doc_len: int) -> 'pd.DataFrame':
         """ Extend every string row into new columns by one char """
+        # noinspection PyTypeChecker
         return pd.DataFrame( s.apply(lambda row: list(row)).tolist() )
-
-    @staticmethod
-    def get_char_ind(char_to_ind_map: Dict[str, int], ch: str) -> int:
-        return char_to_ind_map.get(ch, 0)
 
     def __len__(self):
         return len(self._data)
 
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
-        batch_data = self._data[idx, :-1]
-        batch_target = self._data[idx, 1:]
+        batch_data, batch_target = self.transform_func( self._data[idx] )
         return batch_data, batch_target
 
 
@@ -252,7 +260,28 @@ class Processing:
 class ModelsTests:
     train_params: 'TrainParams' = TrainParams(epochs=10, lr=0.002)
 
-    def test_one(self):
+    def test_one(self) -> None:
+        """ Test RNN to predict the following letters """
+
+        vocab = 'abcdefghijklmnopqrstuvwxyz '
+        char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
+        vocab_size = len(vocab) + 1
+
+        data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
+        train_dataset = CustomTextDataset(data, char2int, transform_func=( lambda t: (t[:-1], t[1:])  ))
+
+        model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
+        optimizer = Adam(model.parameters(), lr=0.005)
+
+        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
+        Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
+
+        Processing.predict(model, int2char, char2int, 'le')
+
+
+    def test_two(self) -> None:
+        """ Test RNN with caesar encription """
+
         vocab = 'abcdefghijklmnopqrstuvwxyz '
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         vocab_size = len(vocab) + 1
@@ -270,10 +299,21 @@ class ModelsTests:
 
 
 
+def caesar_enc(text: str, shift: int) -> str:
+    alphabet = ascii_lowercase
+    shifted_alphabet = alphabet[shift:] + alphabet[:shift]
+    table = str.maketrans(alphabet, shifted_alphabet)
+    return text.translate(table)
+
+
 
 def main():
     tests_context = ModelsTests()
     tests_context.test_one()
+
+    # s = "Hello you"
+    # result = caesar_enc(s, 2)
+    # print(result)
 
 
 

@@ -6,8 +6,7 @@ import pandas as pd
 from torch import nn
 
 
-is_cuda = torch.cuda.is_available()
-if is_cuda:
+if torch.cuda.is_available():
     device = torch.device("cuda")
     print("GPU is available")
 else:
@@ -70,12 +69,14 @@ class Processing:
         X = X.to(device)
         for epoch in range(1, n_epochs + 1):
             optimizer.zero_grad()
-            output, hidden = model(X)
 
-            output, y = output.to(device), y.to(device)
-            print(output.shape, y.shape)  # [100, 14, 27]
 
-            loss = criterion(output, y.view(-1).long())
+            # print(X.shape, y.shape)  # [100, 14, 27] - [100, 14]
+            X_predicted, hidden = model(X)
+            X_predicted, y = X_predicted.to(device), y.to(device)
+            # print(X_predicted.shape, y.shape)  # [1400, 27] - [100, 14]
+
+            loss = criterion(X_predicted, y.view(-1).long())
             loss.backward()
             optimizer.step()
 
