@@ -1,2 +1,4 @@
 *.lock
 /stages/*/datasets/
+/.mypy_cache/
+/.idea/

@@ -1,11 +1,11 @@
 # coding: utf-8
 
-import pandas as pd
+import pandas as pd  # type: ignore
 
 from functools import partial
 from itertools import starmap
 from string import ascii_lowercase
-from typing import Union, Tuple, Sequence, Optional, Dict, Callable
+from typing import Union, Tuple, Sequence, Optional, Dict, Callable, Iterable, List, Generator
 from dataclasses import dataclass, field, InitVar
 
 from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max  # type: ignore
@@ -16,9 +16,9 @@ from torch.utils.data import DataLoader, Dataset  # type: ignore
 
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GPU
 
-UNI_CHARS_TYPE = Union[str, Sequence[str]]
+UNI_CHARS_TYPE = Union[str, List[str]]
 _2D_INT_ARRAY = Sequence[Sequence[int]]
-DATA_TRANSFORM_FUNC = Callable[[Sequence], 'Tensor']
+DATA_TRANSFORM_FUNC = Callable[[Iterable], str]
 
 
 
@@ -81,11 +81,11 @@ class CustomTextDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
         s_appendix = [''] * self.doc_len
 
-        s = self._data[idx]
-        s = [ *s, *s_appendix ][:self.doc_len]
+        s_ = self._data[idx]
+        s = [ *s_, *s_appendix ][:self.doc_len]
 
-        X, y = ( self.transform_X(s) if self.transform_X else s ), ( self.transform_y(s) if self.transform_y else s )
-        X, y = self._to_tensor(X), self._to_tensor(y)
+        X_, y_ = ( self.transform_X(s) if self.transform_X else s ), ( self.transform_y(s) if self.transform_y else s )
+        X, y = self._to_tensor(X_), self._to_tensor(y_)
         return X, y
 
 
@@ -102,7 +102,7 @@ class CustomRNN(Module):
     def _init_hidden(self, batch_size: int) -> 'Tensor':
         return zeros(1, batch_size, self.hidden_size)
 
-    def forward(self, out: 'Tensor', hidden: Optional['Tensor'] = None) -> Tuple['Tensor', 'Tensor']:
+    def forward(self, out: 'Tensor') -> Tuple['Tensor', 'Tensor']:
         out = self.emb(out)
         out, hidden = self.rnn(out)
         out = self.out(out)
@@ -141,14 +141,13 @@ class TrainContext:
         if self._current_epoch < self.train_params.epochs:
             self._epoch_start()
 
-            hidden = None
             train_loss = 0
             train_passed = 0
 
             for X_batch, y_batch in Processing.loader_to_device(self._data):
-                X_predicted, hidden = self.model(X_batch, hidden)
+                X_predicted, _ = self.model(X_batch)
 
-                loss = cross_entropy(X_predicted, y_batch.flatten())
+                loss = cross_entropy(X_predicted, y_batch.flatten(0))
                 train_loss += loss.item()
 
                 self.optimizer.zero_grad()
@@ -198,7 +197,7 @@ class Processing:
         return X.to(TORCH_DEVICE), y.to(TORCH_DEVICE)
 
     @staticmethod
-    def loader_to_device(data: 'DataLoader') -> Tuple['Tensor', 'Tensor']:
+    def loader_to_device(data: 'DataLoader') -> Generator[Tuple['Tensor', 'Tensor'], None, None]:
         yield from starmap(Processing._batch_to_device, data)
 
     @staticmethod
@@ -215,7 +214,7 @@ class Processing:
             for images, labels in Processing.loader_to_device(DataLoader(dataset, batch_size=loader_params.batch_size, shuffle=loader_params.batch_shuffle)):
                 outputs = model(images)
                 _, predicted = torch_max(outputs.data, 1)
-                total += labels.size(0)
+                total += labels.size()[0]
                 correct += int( outputs.argmax(dim=1).eq(labels).sum().item() )
 
         result_accuracy = 100 * correct / total
@@ -237,7 +236,7 @@ class Processing:
 
 
     @staticmethod
-    def predict(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: UNI_CHARS_TYPE) -> None:
+    def predict(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> None:
         model.eval()
 
         with no_grad():
@@ -262,8 +261,8 @@ class ModelsTests:
         vocab = 'abcdefghijklmnopqrstuvwxyz '
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         vocab_size = len(vocab) + 1
-        transform_X = ( lambda t: t[:-1] )
-        transform_y = ( lambda t: t[1:] )
+        transform_X = ( lambda s: s[:-1] )
+        transform_y = ( lambda s: s[1:] )
 
         data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
         train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
@@ -279,13 +278,20 @@ class ModelsTests:
 
     def test_two(self) -> None:
         """ Test RNN with caesar encription """
+        def caesar_enc(text: str, shift: int = 3) -> str:
+            alphabet = ascii_lowercase
+            shifted_alphabet = alphabet[shift:] + alphabet[:shift]
+            table = str.maketrans(alphabet, shifted_alphabet)
+            return text.translate(table)
 
         vocab = 'abcdefghijklmnopqrstuvwxyz '
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         vocab_size = len(vocab) + 1
+        transform_X = ( lambda s: caesar_enc(s) )
+        transform_y = ( lambda s: s )
 
         data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
-        train_dataset = CustomTextDataset(data, char2int)
+        train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
 
         model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
@@ -295,13 +301,6 @@ class ModelsTests:
 
         Processing.predict(model, int2char, char2int, 'le')
 
-
-
-def caesar_enc(text: str, shift: int) -> str:
-    alphabet = ascii_lowercase
-    shifted_alphabet = alphabet[shift:] + alphabet[:shift]
-    table = str.maketrans(alphabet, shifted_alphabet)
-    return text.translate(table)
 
 
 
