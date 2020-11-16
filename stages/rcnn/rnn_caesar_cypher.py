@@ -146,9 +146,7 @@ class TrainContext:
             train_passed = 0
 
             for X_batch, y_batch in Processing.loader_to_device(self._data):
-                # print("Train data shapes: ", X_batch.shape, y_batch.shape)  # >>> [100, 14], [100, 14]
                 X_predicted, hidden = self.model(X_batch, hidden)
-                # print("Predicted data shapes: ", X_predicted.shape, y_batch.shape)  # >>> [1400, 28], [100, 14]
 
                 loss = cross_entropy(X_predicted, y_batch.flatten())
                 train_loss += loss.item()
