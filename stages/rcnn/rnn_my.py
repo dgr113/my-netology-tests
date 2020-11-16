@@ -81,6 +81,7 @@ class CustomTextDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
         batch_data = self._data[idx, :-1]
         batch_target = self._data[idx, 1:]
+        print("!!!!", batch_data)
         return batch_data, batch_target
 
 

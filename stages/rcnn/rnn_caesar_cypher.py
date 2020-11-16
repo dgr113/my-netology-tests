@@ -8,7 +8,7 @@ from string import ascii_lowercase
 from typing import Union, Tuple, Sequence, Optional, Dict, Callable
 from dataclasses import dataclass, field, InitVar
 
-from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max, from_numpy as torch_from_numpy  # type: ignore
+from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max  # type: ignore
 from torch.nn import Module, Linear, RNN, Embedding  # type: ignore
 from torch.nn.functional import cross_entropy, softmax  # type: ignore
 from torch.optim import Optimizer, Adam  # type: ignore
@@ -18,7 +18,7 @@ TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GP
 
 UNI_CHARS_TYPE = Union[str, Sequence[str]]
 _2D_INT_ARRAY = Sequence[Sequence[int]]
-DATA_TRANSFORM_FUNC = Callable[['Tensor'], Tuple['Tensor', 'Tensor']]
+DATA_TRANSFORM_FUNC = Callable[[Sequence], 'Tensor']
 
 
 
@@ -47,16 +47,27 @@ class TrainStats:
 
 
 
+
 class CustomTextDataset(Dataset):
     def __init__(
         self,
         data: Sequence[str],
         char2int: Dict[str, int],
-        norm_doc_len: int = 50,
-        *, transform_func: Optional[DATA_TRANSFORM_FUNC] = None
+        doc_len: int = 15,
+        *,
+        transform_X: Optional[DATA_TRANSFORM_FUNC] = None,
+        transform_y: Optional[DATA_TRANSFORM_FUNC] = None
     ):
-        self.transform_func = transform_func
-        self._data = CustomTextDataset.get_tensor_data(data, char2int, norm_doc_len)
+        self.doc_len = doc_len
+        self.transform_X = transform_X
+        self.transform_y = transform_y
+        self._data = data
+        self._to_tensor = partial(CustomTextDataset.get_tensor_data, char2int)
+
+    @staticmethod
+    def get_tensor_data(char2int: Dict[str, int], chars: UNI_CHARS_TYPE, *, as_unsqueeze: bool = False) -> 'Tensor':
+        t = Tensor( list( char2int.get(ch, 0) for ch in chars ) ).long()
+        return t.unsqueeze(0) if as_unsqueeze else t
 
     @staticmethod
     def get_char_ind_map(vocab: Sequence[str]) -> Tuple[Dict[str, int], Dict[int, str]]:
@@ -64,32 +75,19 @@ class CustomTextDataset(Dataset):
         int2char = { i: w for w, i in char2int.items() }
         return char2int, int2char
 
-    @staticmethod
-    def get_tensor_data(text_corpus: Sequence[str], char_to_ind: Dict[str, int], doc_len: int = 50) -> 'Tensor':
-        """ Set inner data as Tensor form """
-        if not isinstance(text_corpus, pd.Series):
-            text_corpus = pd.Series(text_corpus)
-
-        apply_func = partial(CustomTextDataset._get_char_ind, char_to_ind)
-        data = CustomTextDataset._extend_rows(text_corpus, doc_len).applymap( apply_func ).values
-        return torch_from_numpy(data)
-
-    @staticmethod
-    def _get_char_ind(char_to_ind_map: Dict[str, int], ch: str) -> int:
-        return char_to_ind_map.get(ch, 0)
-
-    @staticmethod
-    def _extend_rows(s: 'pd.Series', doc_len: int) -> 'pd.DataFrame':
-        """ Extend every string row into new columns by one char """
-        # noinspection PyTypeChecker
-        return pd.DataFrame( s.apply(lambda row: list(row)).tolist() )
-
     def __len__(self):
         return len(self._data)
 
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
-        batch_data, batch_target = self.transform_func( self._data[idx] )
-        return batch_data, batch_target
+        s_appendix = [''] * self.doc_len
+
+        s = self._data[idx]
+        s = [ *s, *s_appendix ][:self.doc_len]
+
+        X, y = ( self.transform_X(s) if self.transform_X else s ), ( self.transform_y(s) if self.transform_y else s )
+        X, y = self._to_tensor(X), self._to_tensor(y)
+        return X, y
+
 
 
 
@@ -246,7 +244,7 @@ class Processing:
 
         with no_grad():
             for i in range(30):
-                X = CustomTextDataset.get_tensor_data(chars, char2int)
+                X = CustomTextDataset.get_tensor_data(char2int, chars, as_unsqueeze=True)
                 outputs, _ = model(X)
                 predicted_char = Processing._predict_step(int2char, outputs)
                 chars += predicted_char
@@ -266,9 +264,11 @@ class ModelsTests:
         vocab = 'abcdefghijklmnopqrstuvwxyz '
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         vocab_size = len(vocab) + 1
+        transform_X = ( lambda t: t[:-1] )
+        transform_y = ( lambda t: t[1:] )
 
         data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
-        train_dataset = CustomTextDataset(data, char2int, transform_func=( lambda t: (t[:-1], t[1:])  ))
+        train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
 
         model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
