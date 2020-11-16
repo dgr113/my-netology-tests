@@ -51,26 +51,31 @@ class Processing:
         for i in range(batch_size):
             for u in range(seq_len):
                 features[i, u, sequence[i][u]] = 1
-        return features
+
+        return torch.from_numpy(features)
 
 
     @staticmethod
-    def train(model, input_seq, target_seq):
+    def train(model, X, y):
         model = model.to(device)
 
-        n_epochs = 100
+        # print(X.shape, y.shape)  # [100, 14, 27]
+
+        n_epochs = 10
         lr = 0.01
 
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-        input_seq = input_seq.to(device)
+        X = X.to(device)
         for epoch in range(1, n_epochs + 1):
             optimizer.zero_grad()
-            output, hidden = model(input_seq)
-            output = output.to(device)
-            target_seq = target_seq.to(device)
-            loss = criterion(output, target_seq.view(-1).long())
+            output, hidden = model(X)
+
+            output, y = output.to(device), y.to(device)
+            print(output.shape, y.shape)  # [100, 14, 27]
+
+            loss = criterion(output, y.view(-1).long())
             loss.backward()
             optimizer.step()
 
@@ -83,7 +88,6 @@ class Processing:
     def _predict(model, character, char2int, int2char, dict_size):
         character = np.array([[char2int[c] for c in character]])
         character = Processing.one_hot_encode(character, dict_size, character.shape[1], 1)
-        character = torch.from_numpy(character)
         character = character.to(device)
 
         out, hidden = model(character)
@@ -113,7 +117,7 @@ class Processing:
 
 def main():
     # TEXT = ['hey how are you', 'good i am fine', 'have a nice day']
-    TEXT = pd.read_csv('./data.csv')['normalized_text'].fillna('').str[:50].iloc[:100].tolist()
+    TEXT = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
     chars = set('abcdefghijklmnopqrstuvwxyz ')
 
     int2char = dict( enumerate(chars) )
@@ -144,10 +148,7 @@ def main():
     batch_size = len(TEXT)
 
 
-    input_seq = Processing.one_hot_encode(input_seq, dict_size, seq_len, batch_size)
-    # print("Input shape: {} --> (Batch Size, Sequence Length, One-Hot Encoding Size)".format(input_seq.shape))
-
-    input_seq = torch.from_numpy(input_seq)
+    input_seq = Processing.one_hot_encode(input_seq, dict_size, seq_len, batch_size)  # Embedding to extend shape
     target_seq = torch.Tensor(target_seq)
 
 
