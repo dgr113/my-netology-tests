@@ -18,7 +18,7 @@ TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GP
 
 UNI_CHARS_TYPE = Union[str, List[str]]
 _2D_INT_ARRAY = Sequence[Sequence[int]]
-DATA_TRANSFORM_FUNC = Callable[[Iterable], str]
+DATA_TRANSFORM_FUNC = Callable[[Iterable[str]], Sequence[str]]
 
 
 
@@ -241,6 +241,7 @@ class Processing:
 
         with no_grad():
             for i in range(30):
+                chars = "".join(chars)
                 X = CustomTextDataset.get_tensor_data(char2int, chars, as_unsqueeze=True)
                 outputs, _ = model(X)
                 predicted_char = Processing._predict_step(int2char, outputs)
@@ -250,10 +251,43 @@ class Processing:
             print('Predicted: ', result)
 
 
+    @staticmethod
+    def predict_caesar_test(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> None:
+        chars_ = list(chars)
+
+        model.eval()
+        with no_grad():
+            last_char = chars_.pop()
+            last_char_ind = ascii_lowercase.index( last_char.lower() )
+
+            X = CustomTextDataset.get_tensor_data(char2int, chars_, as_unsqueeze=True)
+            outputs, _ = model(X)
+
+            predicted_char = Processing._predict_step(int2char, outputs)
+            predicted_char_ind = ascii_lowercase.index( predicted_char.lower() )
+
+            diff_ind = predicted_char_ind - last_char_ind
+
+            #######
+            results = []
+            for ch in chars:
+                try:
+                    correct_ind = ascii_lowercase.index( ch.lower() ) + diff_ind
+                    real_ind = correct_ind if correct_ind < len(ascii_lowercase) else 0
+                except Exception:
+                    real_ind = None
+
+                real_ch = ascii_lowercase[real_ind] if real_ind is not None else ' '
+                results.append(real_ch)
+
+            print(results)
+            #######
+
+
 
 @dataclass
 class ModelsTests:
-    train_params: 'TrainParams' = TrainParams(epochs=10, lr=0.002)
+    train_params: 'TrainParams' = TrainParams(epochs=100, lr=0.002)
 
     def test_one(self) -> None:
         """ Test RNN to predict the following letters """
@@ -278,38 +312,41 @@ class ModelsTests:
 
     def test_two(self) -> None:
         """ Test RNN with caesar encription """
-        def caesar_enc(text: str, shift: int = 3) -> str:
+        def caesar_enc(s: Iterable[str], shift: int = 3) -> Sequence[str]:
+            if not isinstance(s, str):
+                s = "".join( x or ' ' for x in s )  # ПРОВЕРИТЬ ВОЗМОЖНОСЬ БОЛЕЕ ГИБКОГО РЕШЕНИЯ!
             alphabet = ascii_lowercase
             shifted_alphabet = alphabet[shift:] + alphabet[:shift]
             table = str.maketrans(alphabet, shifted_alphabet)
-            return text.translate(table)
+            return list( s.translate(table) )
 
         vocab = 'abcdefghijklmnopqrstuvwxyz '
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         vocab_size = len(vocab) + 1
-        transform_X = ( lambda s: caesar_enc(s) )
-        transform_y = ( lambda s: s )
+        transform_X = ( lambda s: caesar_enc(s)[:-1] )
+        transform_y = ( lambda s: s[1:] )
 
-        data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
+        data = pd.read_csv('./data/data.csv')['normalized_text'].str[:15].iloc[:1].tolist()
         train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
 
         model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
 
-        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
+        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=False)
         Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
 
-        Processing.predict(model, int2char, char2int, 'le')
+        Processing.predict_caesar_test(model, int2char, char2int, 'pdjjlh orrn zkd')  # maggie look wha
 
 
 
 
 def main():
     tests_context = ModelsTests()
-    tests_context.test_one()
+    tests_context.test_two()
 
-    # s = "Hello you"
-    # result = caesar_enc(s, 2)
+    # s = "Hello you    "
+    # result = caesar_enc(s, 12)
+    # assert len(result) == len(s)
     # print(result)
 
 
