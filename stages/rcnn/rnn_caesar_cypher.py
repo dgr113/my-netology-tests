@@ -5,7 +5,7 @@ import pandas as pd  # type: ignore
 from functools import partial
 from itertools import starmap
 from string import ascii_lowercase
-from typing import Union, Tuple, Sequence, Optional, Dict, Callable, Iterable, List, Generator
+from typing import Union, Tuple, Sequence, Optional, Dict, Callable, List, Generator
 from dataclasses import dataclass, field, InitVar
 
 from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max  # type: ignore
@@ -286,8 +286,7 @@ class Tests:
 
     def test_caesar(self) -> None:
         """ Test RNN with caesar encription """
-        def caesar_enc(alphabet: str, shift: int, s: Iterable[str]) -> str:
-            s = "".join( x or ' ' for x in s )
+        def caesar_enc(alphabet: str, shift: int, s: str) -> str:
             shifted_alphabet = alphabet[shift:] + alphabet[:shift]
             return "".join( s.translate( str.maketrans(alphabet, shifted_alphabet) ) )
 
