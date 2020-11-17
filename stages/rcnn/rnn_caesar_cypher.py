@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader, Dataset  # type: ignore
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GPU
 
 UNI_CHARS_TYPE = Union[str, List[str]]
-_2D_INT_ARRAY = Sequence[Sequence[int]]
-DATA_TRANSFORM_FUNC = Callable[[Iterable[str]], Sequence[str]]
+A2D_INT_ARRAY = Sequence[Sequence[int]]
+DATA_TRANSFORM_FUNC = Callable[[str], str]
 
 
 
@@ -79,10 +79,8 @@ class CustomTextDataset(Dataset):
         return len(self._data)
 
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
-        s_appendix = [''] * self.doc_len
-
-        s_ = self._data[idx]
-        s = [ *s_, *s_appendix ][:self.doc_len]
+        s = self._data[idx]
+        s = s.ljust(self.doc_len)[:self.doc_len]
 
         X_, y_ = ( self.transform_X(s) if self.transform_X else s ), ( self.transform_y(s) if self.transform_y else s )
         X, y = self._to_tensor(X_), self._to_tensor(y_)
@@ -223,20 +221,7 @@ class Processing:
 
 
     @staticmethod
-    def _predict_step(int2char: Dict[int, str], outputs: 'Tensor') -> str:
-        outputs = outputs[-1]  # Get last doc, because there's only one of them
-
-        # print(outputs.shape)  # [1, 5, 28] - 1 документ, 5 символов, 28 вероятностей следующег осимвола для каждого класса
-        prob = softmax(outputs, dim=0).data
-        _, result = torch_max(prob, dim=0)
-
-        predicted_ind = int(result.item())
-        predicted_char = int2char.get(predicted_ind, ' ')
-        return predicted_char
-
-
-    @staticmethod
-    def predict(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> None:
+    def predict(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> str:
         model.eval()
 
         with no_grad():
@@ -244,52 +229,40 @@ class Processing:
                 chars = "".join(chars)
                 X = CustomTextDataset.get_tensor_data(char2int, chars, as_unsqueeze=True)
                 outputs, _ = model(X)
-                predicted_char = Processing._predict_step(int2char, outputs)
+
+                ###
+                outputs = outputs[-1]  # Get last doc, because there's only one of them
+                prob = softmax(outputs, dim=0).data
+                _, d = torch_max(prob, dim=0)
+                predicted_char = int2char.get(int(d.item()), ' ')
+                ###
+
                 chars += predicted_char
 
-            result = ''.join(chars)
-            print('Predicted: ', result)
+            result = "".join(chars)
+            return result
 
 
     @staticmethod
-    def predict_caesar_test(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> None:
-        chars_ = list(chars)
-
+    def predict_caesar(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> str:
         model.eval()
+
         with no_grad():
-            last_char = chars_.pop()
-            last_char_ind = ascii_lowercase.index( last_char.lower() )
-
-            X = CustomTextDataset.get_tensor_data(char2int, chars_, as_unsqueeze=True)
+            X = CustomTextDataset.get_tensor_data(char2int, chars, as_unsqueeze=True)
             outputs, _ = model(X)
+            prob = torch_max(outputs, dim=1)
+            predicted_chars = [ int2char.get(int(ind), ' ') for ind in prob.indices ]
 
-            predicted_char = Processing._predict_step(int2char, outputs)
-            predicted_char_ind = ascii_lowercase.index( predicted_char.lower() )
-
-            diff_ind = predicted_char_ind - last_char_ind
-
-            #######
-            results = []
-            for ch in chars:
-                try:
-                    correct_ind = ascii_lowercase.index( ch.lower() ) + diff_ind
-                    real_ind = correct_ind if correct_ind < len(ascii_lowercase) else 0
-                except Exception:
-                    real_ind = None
-
-                real_ch = ascii_lowercase[real_ind] if real_ind is not None else ' '
-                results.append(real_ch)
-
-            print(results)
-            #######
+            result = "".join( predicted_chars )
+            return result
 
 
 
 @dataclass
-class ModelsTests:
+class Tests:
     train_params: 'TrainParams' = TrainParams(epochs=100, lr=0.002)
 
-    def test_one(self) -> None:
+    def test_phrase(self) -> None:
         """ Test RNN to predict the following letters """
 
         vocab = 'abcdefghijklmnopqrstuvwxyz '
@@ -307,27 +280,26 @@ class ModelsTests:
         train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
         Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
 
-        Processing.predict(model, int2char, char2int, 'le')
+        result = Processing.predict(model, int2char, char2int, 'le')
+        print("PREDICTED PHRASE: '{}'". format(result))
 
 
-    def test_two(self) -> None:
+    def test_caesar(self) -> None:
         """ Test RNN with caesar encription """
-        def caesar_enc(s: Iterable[str], shift: int = 3) -> Sequence[str]:
-            if not isinstance(s, str):
-                s = "".join( x or ' ' for x in s )  # ПРОВЕРИТЬ ВОЗМОЖНОСЬ БОЛЕЕ ГИБКОГО РЕШЕНИЯ!
-            alphabet = ascii_lowercase
+        def caesar_enc(alphabet: str, shift: int, s: Iterable[str]) -> str:
+            s = "".join( x or ' ' for x in s )
             shifted_alphabet = alphabet[shift:] + alphabet[:shift]
-            table = str.maketrans(alphabet, shifted_alphabet)
-            return list( s.translate(table) )
+            return "".join( s.translate( str.maketrans(alphabet, shifted_alphabet) ) )
 
         vocab = 'abcdefghijklmnopqrstuvwxyz '
+        # vocab = ascii_lowercase
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         vocab_size = len(vocab) + 1
-        transform_X = ( lambda s: caesar_enc(s)[:-1] )
-        transform_y = ( lambda s: s[1:] )
 
-        data = pd.read_csv('./data/data.csv')['normalized_text'].str[:15].iloc[:1].tolist()
-        train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
+        transform_X = ( lambda s: caesar_enc(ascii_lowercase, 3, s) )
+
+        data = pd.read_csv('./data/data.csv')['normalized_text'].str[:15].iloc[:10].tolist()
+        train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X)
 
         model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
@@ -335,19 +307,16 @@ class ModelsTests:
         train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=False)
         Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
 
-        Processing.predict_caesar_test(model, int2char, char2int, 'pdjjlh orrn zkd')  # maggie look wha
+        result = Processing.predict_caesar(model, int2char, char2int, 'pdjjlh orrn zkd')  # maggie look wha
+        print("PREDICTED PHRASE: '{}'". format(result))
 
 
 
 
 def main():
-    tests_context = ModelsTests()
-    tests_context.test_two()
+    tests_context = Tests()
+    tests_context.test_caesar()
 
-    # s = "Hello you    "
-    # result = caesar_enc(s, 12)
-    # assert len(result) == len(s)
-    # print(result)
 
 
 
