@@ -8,7 +8,7 @@ from string import ascii_lowercase
 from typing import Union, Tuple, Sequence, Optional, Dict, Callable, List, Generator
 from dataclasses import dataclass, field, InitVar
 
-from torch import Tensor, no_grad, device, cuda, zeros, max as torch_max  # type: ignore
+from torch import Tensor, no_grad, device, cuda, max as torch_max  # type: ignore
 from torch.nn import Module, Linear, RNN, Embedding  # type: ignore
 from torch.nn.functional import cross_entropy, softmax  # type: ignore
 from torch.optim import Optimizer, Adam  # type: ignore
@@ -44,7 +44,6 @@ class TrainStats:
     loss: float
     accuracy: float
     train_params: 'TrainParams'
-
 
 
 
@@ -88,23 +87,21 @@ class CustomTextDataset(Dataset):
 
 
 
-
 class CustomRNN(Module):
-    def __init__(self, input_size: int, output_size: int, hidden_size: int = 128):
+    def __init__(self, input_size: int, emb_size: int, hidden_size: int = 128):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.emb = Embedding(input_size, input_size)
-        self.rnn = RNN(input_size, hidden_size, batch_first=True)
-        self.out = Linear(hidden_size, output_size)
 
-    def _init_hidden(self, batch_size: int) -> 'Tensor':
-        return zeros(1, batch_size, self.hidden_size)
+        self.input_size, self.output_size = [ input_size + 1 ] * 2  # Alignment for case when the vocab length is passed
+
+        self.emb = Embedding(self.input_size, emb_size)
+        self.rnn = RNN(emb_size, hidden_size, batch_first=True)
+        self.out = Linear(hidden_size, self.output_size)
 
     def forward(self, out: 'Tensor') -> Tuple['Tensor', 'Tensor']:
         out = self.emb(out)
         out, hidden = self.rnn(out)
         out = self.out(out)
-        out = out.view(-1, 28)  # Flatten output
+        out = out.view(-1, self.output_size)  # Flatten output
         return out, hidden
 
 
@@ -219,7 +216,6 @@ class Processing:
         print( "Accuracy of the network on test data is: {}%".format(result_accuracy) )
         return result_accuracy
 
-
     @staticmethod
     def predict(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> str:
         model.eval()
@@ -229,19 +225,16 @@ class Processing:
                 chars = "".join(chars)
                 X = CustomTextDataset.get_tensor_data(char2int, chars, as_unsqueeze=True)
                 outputs, _ = model(X)
-
                 ###
                 outputs = outputs[-1]  # Get last doc, because there's only one of them
                 prob = softmax(outputs, dim=0).data
                 _, d = torch_max(prob, dim=0)
                 predicted_char = int2char.get(int(d.item()), ' ')
                 ###
-
                 chars += predicted_char
 
             result = "".join(chars)
             return result
-
 
     @staticmethod
     def predict_caesar(model: 'Module', int2char: Dict[int, str], char2int: Dict[str, int], chars: str) -> str:
@@ -262,59 +255,56 @@ class Processing:
 class Tests:
     train_params: 'TrainParams' = TrainParams(epochs=100, lr=0.002)
 
-    def test_phrase(self) -> None:
+    def test_phrase(self, data: Sequence[str], vocab: str, test_str: str) -> None:
         """ Test RNN to predict the following letters """
 
-        vocab = 'abcdefghijklmnopqrstuvwxyz '
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
-        vocab_size = len(vocab) + 1
         transform_X = ( lambda s: s[:-1] )
         transform_y = ( lambda s: s[1:] )
 
-        data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
         train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
 
-        model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
+        model = CustomRNN(len(vocab), 10).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
 
         train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
         Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
 
-        result = Processing.predict(model, int2char, char2int, 'le')
+        result = Processing.predict(model, int2char, char2int, test_str)
         print("PREDICTED PHRASE: '{}'". format(result))
 
 
-    def test_caesar(self) -> None:
+    def test_caesar(self, data: Sequence[str], vocab: str, test_str: str) -> None:
         """ Test RNN with caesar encription """
-        def caesar_enc(alphabet: str, shift: int, s: str) -> str:
+
+        def _caesar_enc(alphabet: str, shift: int, s: str) -> str:
             shifted_alphabet = alphabet[shift:] + alphabet[:shift]
             return "".join( s.translate( str.maketrans(alphabet, shifted_alphabet) ) )
 
-        vocab = 'abcdefghijklmnopqrstuvwxyz '
-        # vocab = ascii_lowercase
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
-        vocab_size = len(vocab) + 1
+        transform_X = ( lambda s: _caesar_enc(vocab, 3, s) )
 
-        transform_X = ( lambda s: caesar_enc(ascii_lowercase, 3, s) )
-
-        data = pd.read_csv('./data/data.csv')['normalized_text'].str[:15].iloc[:10].tolist()
         train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X)
 
-        model = CustomRNN(vocab_size, vocab_size).to(TORCH_DEVICE)
+        model = CustomRNN(len(vocab), 10).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
 
-        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=False)
+        train_loader_params = DataLoaderParams(batch_size=256, batch_shuffle=True)
         Processing.train_model(train_dataset, self.train_params, train_loader_params, model, optimizer)
 
-        result = Processing.predict_caesar(model, int2char, char2int, 'pdjjlh orrn zkd')  # maggie look wha
+        result = Processing.predict_caesar(model, int2char, char2int, _caesar_enc(vocab, 3, test_str))  # maggie look wha
         print("PREDICTED PHRASE: '{}'". format(result))
 
 
 
 
 def main():
+    data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
+    vocab = ascii_lowercase
+
     tests_context = Tests()
-    tests_context.test_caesar()
+    # tests_context.test_phrase(data, vocab, 'le')
+    tests_context.test_caesar(data, vocab, 'maggie look wha')
 
 
 

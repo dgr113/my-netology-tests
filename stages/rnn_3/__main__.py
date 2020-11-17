@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from torch import device, cuda  # type: ignore
 from torch.optim import Adam  # type: ignore
 
-from stages.RNN_with_classes.helpers import TrainParams, CustomTextDataset, DataLoaderParams
-from stages.RNN_with_classes.models import CustomEncoder, CustomDecoder, Seq2Seq
-from stages.RNN_with_classes.processing import Processing
+from stages.rnn_3.helpers import TrainParams, CustomTextDataset, DataLoaderParams
+from stages.rnn_3.models import CustomEncoder, CustomDecoder, Seq2Seq
+from stages.rnn_3.processing import Processing
 
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )  # USE CUDA GPU
 
