@@ -41,7 +41,7 @@ def func():
     ext_file_save('https://s3.amazonaws.com/text-datasets/nietzsche.txt', './nietzsche.txt')
 
     df = pd.DataFrame( batch_generator('./nietzsche.txt', 41, 3) )
-    df = pd.DataFrame( df[0].str.lower().str.replace(r'[^a-z\s]]', '').apply( lambda s: (s[:-1], s[-1:]) ).tolist() )
+    df = pd.DataFrame( df[0].str.lower().str.replace(r'[^a-z\s]', ' ').str.replace(r'\s\s+', ' ').apply( lambda s: (s[:-1], s[-1:]) ).tolist() )
     print( df.head() )
 
 
