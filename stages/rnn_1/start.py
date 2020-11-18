@@ -52,7 +52,7 @@ class CustomTextDataset(Dataset):
         self,
         data: Sequence[str],
         char2int: Dict[str, int],
-        doc_len: int = 15,
+        doc_len: int,
         *,
         transform_X: Optional[DATA_TRANSFORM_FUNC] = None,
         transform_y: Optional[DATA_TRANSFORM_FUNC] = None
@@ -80,7 +80,6 @@ class CustomTextDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
         s = self._data[idx]
         s = s.ljust(self.doc_len)[:self.doc_len]
-
         X_, y_ = ( self.transform_X(s) if self.transform_X else s ), ( self.transform_y(s) if self.transform_y else s )
         X, y = self._to_tensor(X_), self._to_tensor(y_)
         return X, y
@@ -262,7 +261,7 @@ class Tests:
         transform_X = ( lambda s: s[:-1] )
         transform_y = ( lambda s: s[1:] )
 
-        train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X, transform_y=transform_y)
+        train_dataset = CustomTextDataset(data, char2int, 15, transform_X=transform_X, transform_y=transform_y)
 
         model = CustomRNN(len(vocab), 10).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
@@ -284,7 +283,7 @@ class Tests:
         char2int, int2char = CustomTextDataset.get_char_ind_map(vocab)
         transform_X = ( lambda s: _caesar_enc(vocab, 3, s) )
 
-        train_dataset = CustomTextDataset(data, char2int, transform_X=transform_X)
+        train_dataset = CustomTextDataset(data, char2int, 15, transform_X=transform_X)
 
         model = CustomRNN(len(vocab), 10).to(TORCH_DEVICE)
         optimizer = Adam(model.parameters(), lr=0.005)
@@ -299,7 +298,7 @@ class Tests:
 
 
 def main():
-    data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:15].iloc[:100].tolist()
+    data = pd.read_csv('./data/data.csv')['normalized_text'].fillna('').str[:5].iloc[:100].tolist()
     vocab = ascii_lowercase
 
     tests_context = Tests()
