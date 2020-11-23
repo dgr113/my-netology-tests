@@ -22,15 +22,15 @@ from dataclasses import dataclass
 from typing import Sequence, Tuple, Union, List, Dict
 
 from torch import Tensor, zeros as torch_zeros
-from torch.nn.modules.loss import _Loss
-from torch.optim import Optimizer, SGD
+from torch.optim import SGD
 
-TORCH_DEVICE = torch.device( 'cuda' if torch.cuda.is_available() else 'cpu' )
+TORCH_DEVICE = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
 
 
 UNI_PATH_TYPE = Union[Path, str]
 UNI_NUM_TYPE = Union[int, float]
 LANG_PAIR = Tuple[str, str]
+
 
 
 
@@ -114,12 +114,12 @@ class PrepareData:
 
     @classmethod
     def prepare_data(
-        cls,
-        input_lang: 'Lang',
-        output_lang: 'Lang',
-        pairs: Sequence[Tuple[str, str]],
-        max_length: int,
-        eng_prefixes: Tuple[str, ...]
+            cls,
+            input_lang: 'Lang',
+            output_lang: 'Lang',
+            pairs: Sequence[Tuple[str, str]],
+            max_length: int,
+            eng_prefixes: Tuple[str, ...]
 
     ) -> Tuple['Lang', 'Lang', Sequence[Tuple[str, str]]]:
 
@@ -129,45 +129,6 @@ class PrepareData:
             output_lang.add_sentence( pair[1] )
 
         return input_lang, output_lang, pairs
-
-
-
-class EncoderRNN(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-
-    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
-        embedded = self.embedding(inp).view(1, 1, -1)
-        output = embedded
-        output, hidden = self.gru(output, hidden)
-        return output, hidden
-
-    def init_hidden(self) -> 'Tensor':
-        return torch.zeros(1, 1, self.hidden_size, device=TORCH_DEVICE)
-
-
-
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size: int, output_size: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.LogSoftmax(dim=1)
-
-    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
-        output = self.embedding(inp).view(1, 1, -1)
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
-        output = self.softmax(self.out(output[0]))
-        return output, hidden
-
-    def init_hidden(self) -> 'Tensor':
-        return torch.zeros(1, 1, self.hidden_size, device=TORCH_DEVICE)
 
 
 
@@ -218,94 +179,133 @@ class Visualize:
 
 
 
-@dataclass
-class TrainContext:
-    SOS_token: int
-    EOS_token: int
-    teacher_forcing_ratio: float = 0.5
+class EncoderRNN(nn.Module):
+    def __init__(self, hidden_size: int, input_size: int):
+        super().__init__()
 
-    def train_apply(
-        self,
-        loss,
-        criterion,
-        target_length: int,
-        decoder: 'DecoderRNN',
-        target_tensor: 'Tensor',
-        decoder_input: 'Tensor',
-        decoder_hidden: 'Tensor',
-        use_teacher_forcing: bool
-    ):
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+
+    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
+        embedded = self.embedding(inp).view(1, 1, -1)
+        output = embedded
+        output, hidden = self.gru(output, hidden)
+        return output, hidden
+
+    def init_hidden(self) -> 'Tensor':
+        return torch.zeros(1, 1, self.hidden_size, device=TORCH_DEVICE)
+
+
+
+class DecoderRNN(nn.Module):
+    def __init__(self, hidden_size: int, output_size: int):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(output_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.out = nn.Linear(hidden_size, output_size)
+        self.softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
+        output = self.embedding(inp).view(1, 1, -1)
+        output = F.relu(output)
+        output, hidden = self.gru(output, hidden)
+        output = self.softmax(self.out(output[0]))
+        return output, hidden
+
+    def init_hidden(self) -> 'Tensor':
+        return torch.zeros(1, 1, self.hidden_size, device=TORCH_DEVICE)
+
+
+
+class Seq2Seq(nn.Module):
+    def __init__(self, lr: float, encoder: 'EncoderRNN', decoder: 'DecoderRNN', SOS_token: int, EOS_token: int, teacher_forcing_ratio: float = 0.5):
+        super().__init__()
+
+        self.encoder = encoder
+        self.decoder = decoder
+
+        self.loss = nn.NLLLoss()
+        self.encoder_optimizer = SGD(encoder.parameters(), lr=lr)
+        self.decoder_optimizer = SGD(decoder.parameters(), lr=lr)
+
+        self.SOS_token = SOS_token
+        self.EOS_token = EOS_token
+        self.teacher_forcing_ratio = teacher_forcing_ratio
+
+
+    def _train_apply(
+            self,
+            train_loss: 'Tensor',
+            target_length: int,
+            target_tensor: 'Tensor',
+            decoder_input: 'Tensor',
+            decoder_hidden: 'Tensor',
+            use_teacher_forcing: bool
+
+    ) -> 'Tensor':
+
         if use_teacher_forcing:
             # Teacher forcing: Feed the target as the next input
             for di in range(target_length):
-                decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-                loss += criterion(decoder_output, target_tensor[di])
+                decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+                train_loss += self.loss(decoder_output, target_tensor[di])
                 decoder_input = target_tensor[di]  # Teacher forcing
         else:
             # Without teacher forcing: use its own predictions as the next input
             for di in range(target_length):
-                decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+                decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
                 topv, topi = decoder_output.topk(1)
                 decoder_input = topi.squeeze().detach()  # detach from history as input
 
-                loss += criterion(decoder_output, target_tensor[di])
+                train_loss += self.loss(decoder_output, target_tensor[di])
                 if decoder_input.item() == self.EOS_token:
                     break
-        return loss
+        return train_loss
 
 
-    def train(
-        self,
-        input_tensor: 'Tensor',
-        target_tensor: 'Tensor',
-        encoder: 'EncoderRNN',
-        decoder: 'DecoderRNN',
-        encoder_optimizer: 'Optimizer',
-        decoder_optimizer: 'Optimizer',
-        criterion: '_Loss',
-        max_length: int
+    def train_new(self, loss, input_tensor: 'Tensor', target_tensor: 'Tensor', max_length: int) -> float:
+        encoder_hidden = self.encoder.init_hidden()
 
-    ) -> float:
-
-        encoder_hidden = encoder.init_hidden()
-
-        encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
 
         input_length = input_tensor.size()[0]
         target_length = target_tensor.size()[0]
-        encoder_outputs = torch_zeros(max_length, encoder.hidden_size, device=TORCH_DEVICE)
-
-        loss = Tensor([0]).to(TORCH_DEVICE)
+        encoder_outputs = torch_zeros(max_length, self.encoder.hidden_size, device=TORCH_DEVICE)
 
         for ei in range(input_length):
-            encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+            encoder_output, encoder_hidden = self.encoder(input_tensor[ei], encoder_hidden)
             encoder_outputs[ei] = encoder_output[0, 0]
 
         decoder_input = torch.tensor([[self.SOS_token]], device=TORCH_DEVICE)
         decoder_hidden = encoder_hidden
         use_teacher_forcing = True if random() < self.teacher_forcing_ratio else False
 
-        loss = self.train_apply(loss, criterion, target_length, decoder, target_tensor, decoder_input, decoder_hidden, use_teacher_forcing)
+        train_loss = self._train_apply(loss, target_length, target_tensor, decoder_input, decoder_hidden, use_teacher_forcing)
+        train_loss.backward()
 
-        loss.backward()
-        encoder_optimizer.step()
-        decoder_optimizer.step()
-        return loss.item() / target_length
+        self.encoder_optimizer.step()
+        self.decoder_optimizer.step()
+        return train_loss.item() / target_length
 
 
-    def train_iters(
-        self,
-        max_length: int,
-        pairs: Sequence[LANG_PAIR],
-        input_lang: 'Lang',
-        output_lang: 'Lang',
-        encoder: 'EncoderRNN',
-        decoder: 'DecoderRNN',
-        n_iters: int,
-        print_every: int = 1000,
-        plot_every: int = 100,
-        learning_rate: float = 0.01
+
+@dataclass
+class TrainContext:
+    model: Seq2Seq
+
+    def train_model(
+            self,
+            max_length: int,
+            pairs: Sequence[LANG_PAIR],
+            input_lang: 'Lang',
+            output_lang: 'Lang',
+            n_iters: int,
+            print_every: int = 1000,
+            plot_every: int = 100,
 
     ) -> None:
 
@@ -313,24 +313,20 @@ class TrainContext:
         plot_losses = []
         print_loss_total, plot_loss_total = 0.0, 0.0
 
-        encoder_optimizer = SGD(encoder.parameters(), lr=learning_rate)
-        decoder_optimizer = SGD(decoder.parameters(), lr=learning_rate)
-
         training_pairs = [
-            ConvertFrom.tensors_from_pair(choice(pairs), input_lang, output_lang, self.EOS_token)
+            ConvertFrom.tensors_from_pair(choice(pairs), input_lang, output_lang, self.model.EOS_token)
             for i in range(n_iters)
         ]
 
-        criterion = nn.NLLLoss()
-
+        train_loss_value = 0.0
         for itr in range(1, n_iters + 1):
             training_pair = training_pairs[itr - 1]
             input_tensor = training_pair[0]
             target_tensor = training_pair[1]
 
-            loss = self.train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_length)
-            print_loss_total += loss
-            plot_loss_total += loss
+            train_loss_value = self.model.train_new(train_loss_value, input_tensor, target_tensor, max_length)
+            print_loss_total += train_loss_value
+            plot_loss_total += train_loss_value
 
             if itr % print_every == 0.0:
                 print_loss_avg = print_loss_total / print_every
@@ -369,13 +365,13 @@ class EvalContext:
 
 
     def evaluate(
-        self,
-        input_lang: 'Lang',
-        output_lang: 'Lang',
-        encoder: 'EncoderRNN',
-        decoder: 'DecoderRNN',
-        sentence: str,
-        max_length: int
+            self,
+            input_lang: 'Lang',
+            output_lang: 'Lang',
+            encoder: 'EncoderRNN',
+            decoder: 'DecoderRNN',
+            sentence: str,
+            max_length: int
 
     ) -> List[str]:
 
@@ -395,14 +391,14 @@ class EvalContext:
 
 
     def evaluate_randomly(
-        self,
-        max_length: int,
-        pairs: Sequence[LANG_PAIR],
-        input_lang: 'Lang',
-        output_lang: 'Lang',
-        encoder: 'EncoderRNN',
-        decoder: 'DecoderRNN',
-        n: int = 10
+            self,
+            max_length: int,
+            pairs: Sequence[LANG_PAIR],
+            input_lang: 'Lang',
+            output_lang: 'Lang',
+            encoder: 'EncoderRNN',
+            decoder: 'DecoderRNN',
+            n: int = 10
 
     ) -> None:
 
@@ -418,6 +414,7 @@ class EvalContext:
 
 
 
+
 def main():
     MAX_LENGTH = 10
     ENG_PREFIXES = (
@@ -429,6 +426,7 @@ def main():
         "they are", "they re "
     )
     HIDDEN_SIZE = 256
+    LEARNING_RATE = 0.01
 
 
     FileUtils.load_archive('https://download.pytorch.org/tutorial/data.zip', './')
@@ -444,9 +442,16 @@ def main():
 
     encoder = EncoderRNN(HIDDEN_SIZE, input_lang_words_count).to(TORCH_DEVICE)
     decoder = DecoderRNN(HIDDEN_SIZE, output_lang_words_count).to(TORCH_DEVICE)
+    seq2seq = Seq2Seq(LEARNING_RATE, encoder, decoder, 0, 1)
 
-    train_context = TrainContext(0, 1)
-    train_context.train_iters(MAX_LENGTH, pairs, input_lang, output_lang, encoder, decoder, 75000, print_every=5000)
+    train_context = TrainContext(seq2seq)
+    train_context.train_model(MAX_LENGTH, pairs, input_lang, output_lang, 75000, print_every=5000)
 
     eval_context = EvalContext(0, 1)
     eval_context.evaluate_randomly(MAX_LENGTH, pairs, input_lang, output_lang,  encoder, decoder)
+
+
+
+
+if __name__ == '__main__':
+    main()
