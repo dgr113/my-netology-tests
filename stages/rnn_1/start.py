@@ -120,6 +120,8 @@ class TrainContext:
             train_passed = 0
 
             for X_batch, y_batch in Processing.loader_to_device(self._data):
+                print("111111111", y_batch)
+
                 X_predicted, _ = self.model(X_batch)
 
                 loss = cross_entropy(X_predicted, y_batch.flatten(0))
