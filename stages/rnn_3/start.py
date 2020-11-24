@@ -3,9 +3,6 @@
 import re
 import unicodedata
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import matplotlib.pyplot as plt  # type: ignore
 import matplotlib.ticker as ticker  # type: ignore
 
@@ -19,18 +16,18 @@ from zipfile import ZipFile
 from functools import partial
 from random import random, choice
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Union, List, Dict
+from typing import Sequence, Tuple, Union, List, Dict, Type
 
-from torch import Tensor, zeros as torch_zeros
+from torch import Tensor, device, cuda, tensor, long as torch_long, zeros as torch_zeros, no_grad, relu
+from torch.nn import Module, Embedding, Linear, RNNBase, LogSoftmax, NLLLoss, RNN, GRU, LSTM
 from torch.optim import SGD
 
-TORCH_DEVICE = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
-
+TORCH_DEVICE = device( "cuda" if cuda.is_available() else "cpu" )
 
 UNI_PATH_TYPE = Union[Path, str]
 UNI_NUM_TYPE = Union[int, float]
 LANG_PAIR = Tuple[str, str]
-
+COMMON_RNN_TYPE = Type[RNNBase]
 
 
 
@@ -141,7 +138,7 @@ class ConvertFrom:
     def tensor_from_sentence(cls, lang: 'Lang', sentence, eos_token: int) -> 'Tensor':
         indexes = cls.indexes_from_sentence(lang, sentence)
         indexes.append(eos_token)
-        return torch.tensor(indexes, dtype=torch.long, device=TORCH_DEVICE).view(-1, 1)
+        return tensor(indexes, dtype=torch_long, device=TORCH_DEVICE).view(-1, 1)
 
     @classmethod
     def tensors_from_pair(cls, pair: LANG_PAIR, input_lang: 'Lang', output_lang: 'Lang', eos_token: int) -> Tuple['Tensor', 'Tensor']:
@@ -173,61 +170,20 @@ class Visualize:
     def show_plot(points):
         plt.figure()
         fig, ax = plt.subplots()
-        loc = ticker.MultipleLocator(base=0.2)  # this locator puts ticks at regular intervals
+        loc = ticker.MultipleLocator(base=0.2)
         ax.yaxis.set_major_locator(loc)
         plt.plot(points)
 
 
 
-class EncoderRNN(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int):
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-
-    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
-        embedded = self.embedding(inp).view(1, 1, -1)
-        output = embedded
-        output, hidden = self.gru(output, hidden)
-        return output, hidden
-
-    def init_hidden(self) -> 'Tensor':
-        return torch.zeros(1, 1, self.hidden_size, device=TORCH_DEVICE)
-
-
-
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size: int, output_size: int):
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.LogSoftmax(dim=1)
-
-    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
-        output = self.embedding(inp).view(1, 1, -1)
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
-        output = self.softmax(self.out(output[0]))
-        return output, hidden
-
-    def init_hidden(self) -> 'Tensor':
-        return torch.zeros(1, 1, self.hidden_size, device=TORCH_DEVICE)
-
-
-
-class Seq2Seq(nn.Module):
+class Seq2Seq(Module):
     def __init__(self, lr: float, encoder: 'EncoderRNN', decoder: 'DecoderRNN', SOS_token: int, EOS_token: int, teacher_forcing_ratio: float = 0.5):
         super().__init__()
 
         self.encoder = encoder
         self.decoder = decoder
 
-        self.loss = nn.NLLLoss()
+        self.loss = NLLLoss()
         self.encoder_optimizer = SGD(encoder.parameters(), lr=lr)
         self.decoder_optimizer = SGD(decoder.parameters(), lr=lr)
 
@@ -280,7 +236,7 @@ class Seq2Seq(nn.Module):
             encoder_output, encoder_hidden = self.encoder(input_tensor[ei], encoder_hidden)
             encoder_outputs[ei] = encoder_output[0, 0]
 
-        decoder_input = torch.tensor([[self.SOS_token]], device=TORCH_DEVICE)
+        decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)
         decoder_hidden = encoder_hidden
         use_teacher_forcing = True if random() < self.teacher_forcing_ratio else False
 
@@ -290,6 +246,51 @@ class Seq2Seq(nn.Module):
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
         return train_loss.item() / target_length
+
+
+
+class EncoderRNN(Module):
+    def __init__(self, rnn_class: COMMON_RNN_TYPE, hidden_size: int, input_size: int, num_layers: int = 1):
+        super().__init__()
+
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.embedding = Embedding(input_size, hidden_size)
+        self.rnn = rnn_class(hidden_size, hidden_size, num_layers)
+
+    def forward(self, inp: 'Tensor', hidden: 'Tensor') -> Tuple['Tensor', 'Tensor']:
+        output = self.embedding(inp).view(1, 1, -1)
+        output, hidden = self.rnn(output, hidden)
+        return output, hidden
+
+    def init_hidden(self) -> 'Tensor':
+        t = torch_zeros(self.num_layers, 1, self.hidden_size, device=TORCH_DEVICE)
+        return t*2 if ( self.rnn.__class__.__name__ == 'LSTM' ) else t
+
+
+
+class DecoderRNN(Module):
+    def __init__(self, rnn_class: COMMON_RNN_TYPE, hidden_size: int, output_size: int, num_layers: int = 1):
+        super().__init__()
+
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.embedding = Embedding(output_size, hidden_size)
+        self.rnn = rnn_class(hidden_size, hidden_size, num_layers)
+        self.out = Linear(hidden_size, output_size)
+        self.softmax = LogSoftmax(dim=1)
+
+    def forward(self, inp: 'Tensor', hidden: Tensor) -> Tuple['Tensor', 'Tensor']:
+        output = inp.view(1, -1)
+        output = self.embedding(output)
+        output = relu(output)
+        output, hidden = self.rnn(output, hidden)
+        output = self.softmax(self.out(output[0]))
+        return output, hidden
+
+    def init_hidden(self) -> 'Tensor':
+        t = torch_zeros(self.num_layers, 1, self.hidden_size, device=TORCH_DEVICE)
+        return t*2 if ( self.rnn.__class__.__name__ == 'LSTM' ) else t
 
 
 
@@ -315,7 +316,7 @@ class TrainContext:
 
         training_pairs = [
             ConvertFrom.tensors_from_pair(choice(pairs), input_lang, output_lang, self.model.EOS_token)
-            for i in range(n_iters)
+            for _ in range(n_iters)
         ]
 
         train_loss_value = 0.0
@@ -349,7 +350,7 @@ class EvalContext:
     EOS_token: int
 
     def get_decoded_words(self, output_lang: 'Lang', decoder: 'DecoderRNN', decoder_hidden: 'Tensor', max_length: int) -> List[str]:
-        decoder_input = torch.tensor([[self.SOS_token]], device=TORCH_DEVICE)  # SOS
+        decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)  # SOS
         decoded_words = []
         for di in range(max_length):
             decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
@@ -375,12 +376,12 @@ class EvalContext:
 
     ) -> List[str]:
 
-        with torch.no_grad():
+        with no_grad():
             input_tensor = ConvertFrom.tensor_from_sentence(input_lang, sentence, self.EOS_token)
             input_length = input_tensor.size()[0]
             encoder_hidden = encoder.init_hidden()
 
-            encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=TORCH_DEVICE)
+            encoder_outputs = torch_zeros(max_length, encoder.hidden_size, device=TORCH_DEVICE)
 
             for ei in range(input_length):
                 encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
@@ -416,7 +417,14 @@ class EvalContext:
 
 
 def main():
+    SOS_INDEX, EOS_INDEX = 0, 1
+    LEARNING_RATE = 0.01
+
+    RNN_TYPE = GRU
     MAX_LENGTH = 10
+    HIDDEN_SIZE = 256
+    HIDDEN_LAYERS_COUNT = 3
+
     ENG_PREFIXES = (
         "i am ", "i m ",
         "he is", "he s ",
@@ -425,8 +433,6 @@ def main():
         "we are", "we re ",
         "they are", "they re "
     )
-    HIDDEN_SIZE = 256
-    LEARNING_RATE = 0.01
 
 
     FileUtils.load_archive('https://download.pytorch.org/tutorial/data.zip', './')
@@ -440,14 +446,14 @@ def main():
     input_lang_words_count = len(input_lang.word_counter)
     output_lang_words_count = len(output_lang.word_counter)
 
-    encoder = EncoderRNN(HIDDEN_SIZE, input_lang_words_count).to(TORCH_DEVICE)
-    decoder = DecoderRNN(HIDDEN_SIZE, output_lang_words_count).to(TORCH_DEVICE)
-    seq2seq = Seq2Seq(LEARNING_RATE, encoder, decoder, 0, 1)
+    encoder = EncoderRNN(RNN_TYPE, HIDDEN_SIZE, input_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
+    decoder = DecoderRNN(RNN_TYPE, HIDDEN_SIZE, output_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
+    seq2seq = Seq2Seq(LEARNING_RATE, encoder, decoder, SOS_INDEX, EOS_INDEX)
 
     train_context = TrainContext(seq2seq)
     train_context.train_model(MAX_LENGTH, pairs, input_lang, output_lang, 75000, print_every=5000)
 
-    eval_context = EvalContext(0, 1)
+    eval_context = EvalContext(SOS_INDEX, EOS_INDEX)
     eval_context.evaluate_randomly(MAX_LENGTH, pairs, input_lang, output_lang,  encoder, decoder)
 
 
