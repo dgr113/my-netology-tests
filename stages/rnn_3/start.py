@@ -11,7 +11,7 @@ from time import time
 from math import floor
 from pathlib import Path
 from collections import Counter
-from urllib.request import urlretrieve
+from urllib import request
 from zipfile import ZipFile
 from functools import partial
 from random import random, choice
@@ -20,25 +20,33 @@ from typing import Sequence, Tuple, Union, List, Dict, Type
 
 from torch import Tensor, device, cuda, tensor, long as torch_long, zeros as torch_zeros, no_grad, relu
 from torch.nn import Module, Embedding, Linear, RNNBase, LogSoftmax, NLLLoss, RNN, GRU, LSTM
-from torch.optim import SGD
+from torch.optim import SGD, Optimizer
 
-TORCH_DEVICE = device( "cuda" if cuda.is_available() else "cpu" )
+TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )
 
 UNI_PATH_TYPE = Union[Path, str]
 UNI_NUM_TYPE = Union[int, float]
 LANG_PAIR = Tuple[str, str]
 COMMON_RNN_TYPE = Type[RNNBase]
+HIDDEN_TYPE = Union[Tensor, Tuple[Tensor, Tensor]]
 
 
 
 
 class FileUtils:
     @staticmethod
+    def _download_archive(url: str, tmp_file_path: UNI_PATH_TYPE) -> None:
+        opener = request.build_opener()
+        opener.addheaders = []
+        request.install_opener(opener)
+        request.urlretrieve(url, tmp_file_path)
+
+    @staticmethod
     def load_archive(url: str, save_dir: UNI_PATH_TYPE, tmp_file_path: UNI_PATH_TYPE = './tmp.archive') -> None:
         tmp_file_path = Path(tmp_file_path)
         save_dir = Path(save_dir)
 
-        urlretrieve(url, tmp_file_path)
+        FileUtils._download_archive(url, tmp_file_path)
         with ZipFile(tmp_file_path, 'r') as zf:
             zf.extractall(save_dir)
 
@@ -69,7 +77,11 @@ class Lang:
     def read_langs(lang_file_path: UNI_PATH_TYPE, lang1: str, lang2: str, reverse: bool = False, lang_split_ch: str = '\t') -> Tuple['Lang', 'Lang', list]:
         lines = open(Path(lang_file_path), encoding='utf-8').read().strip().split('\n')  # Read the file and split into lines
 
-        pairs = [ [ PrepareData.normalize_string(s) for s in l.split(lang_split_ch) ] for l in lines ]
+        pairs = [
+            [ PrepareData.normalize_string(s) for s in l.split(lang_split_ch)[:2] ]
+            for l in lines
+        ]
+
         if reverse:
             pairs = [ list(reversed(p)) for p in pairs ]
             input_lang = Lang(lang2)
@@ -95,7 +107,7 @@ class PrepareData:
     def normalize_string(cls, s: str) -> str:
         s = cls.unicode_to_ascii( s.lower().strip() )
         s = re.sub(r"([.!?])", r" \1", s)
-        s = re.sub(r"[^a-zA-Z.!?]+", r" ", s)
+        s = re.sub(r"[^0-9a-zA-Zа-яА-Я.!?]+", r" ", s)
         return s
 
     @staticmethod
@@ -111,12 +123,12 @@ class PrepareData:
 
     @classmethod
     def prepare_data(
-            cls,
-            input_lang: 'Lang',
-            output_lang: 'Lang',
-            pairs: Sequence[Tuple[str, str]],
-            max_length: int,
-            eng_prefixes: Tuple[str, ...]
+        cls,
+        input_lang: 'Lang',
+        output_lang: 'Lang',
+        pairs: Sequence[Tuple[str, str]],
+        max_length: int,
+        eng_prefixes: Tuple[str, ...]
 
     ) -> Tuple['Lang', 'Lang', Sequence[Tuple[str, str]]]:
 
@@ -177,15 +189,12 @@ class Visualize:
 
 
 class Seq2Seq(Module):
-    def __init__(self, lr: float, encoder: 'EncoderRNN', decoder: 'DecoderRNN', SOS_token: int, EOS_token: int, teacher_forcing_ratio: float = 0.5):
+    def __init__(self, encoder: 'EncoderRNN', decoder: 'DecoderRNN', loss, SOS_token: int, EOS_token: int, teacher_forcing_ratio: float = 0.5):
         super().__init__()
 
         self.encoder = encoder
         self.decoder = decoder
-
-        self.loss = NLLLoss()
-        self.encoder_optimizer = SGD(encoder.parameters(), lr=lr)
-        self.decoder_optimizer = SGD(decoder.parameters(), lr=lr)
+        self.loss = loss
 
         self.SOS_token = SOS_token
         self.EOS_token = EOS_token
@@ -193,13 +202,13 @@ class Seq2Seq(Module):
 
 
     def _train_apply(
-            self,
-            train_loss: 'Tensor',
-            target_length: int,
-            target_tensor: 'Tensor',
-            decoder_input: 'Tensor',
-            decoder_hidden: 'Tensor',
-            use_teacher_forcing: bool
+        self,
+        train_loss: 'Tensor',
+        target_length: int,
+        target_tensor: 'Tensor',
+        decoder_input: 'Tensor',
+        decoder_hidden: HIDDEN_TYPE,
+        use_teacher_forcing: bool
 
     ) -> 'Tensor':
 
@@ -222,11 +231,10 @@ class Seq2Seq(Module):
         return train_loss
 
 
-    def train_new(self, loss, input_tensor: 'Tensor', target_tensor: 'Tensor', max_length: int) -> float:
+    def train_(self, loss, optimizer, input_tensor: 'Tensor', target_tensor: 'Tensor', max_length: int) -> float:
         encoder_hidden = self.encoder.init_hidden()
 
-        self.encoder_optimizer.zero_grad()
-        self.decoder_optimizer.zero_grad()
+        optimizer.zero_grad()
 
         input_length = input_tensor.size()[0]
         target_length = target_tensor.size()[0]
@@ -242,9 +250,8 @@ class Seq2Seq(Module):
 
         train_loss = self._train_apply(loss, target_length, target_tensor, decoder_input, decoder_hidden, use_teacher_forcing)
         train_loss.backward()
+        optimizer.step()
 
-        self.encoder_optimizer.step()
-        self.decoder_optimizer.step()
         return train_loss.item() / target_length
 
 
@@ -263,9 +270,9 @@ class EncoderRNN(Module):
         output, hidden = self.rnn(output, hidden)
         return output, hidden
 
-    def init_hidden(self) -> 'Tensor':
+    def init_hidden(self) -> HIDDEN_TYPE:
         t = torch_zeros(self.num_layers, 1, self.hidden_size, device=TORCH_DEVICE)
-        return t*2 if ( self.rnn.__class__.__name__ == 'LSTM' ) else t
+        return (t, t) if ( self.rnn.__class__.__name__ == 'LSTM' ) else t
 
 
 
@@ -288,25 +295,26 @@ class DecoderRNN(Module):
         output = self.softmax(self.out(output[0]))
         return output, hidden
 
-    def init_hidden(self) -> 'Tensor':
+    def init_hidden(self) -> HIDDEN_TYPE:
         t = torch_zeros(self.num_layers, 1, self.hidden_size, device=TORCH_DEVICE)
-        return t*2 if ( self.rnn.__class__.__name__ == 'LSTM' ) else t
+        return (t, t) if ( self.rnn.__class__.__name__ == 'LSTM' ) else t
 
 
 
 @dataclass
 class TrainContext:
     model: Seq2Seq
+    optimizer: 'Optimizer'
 
     def train_model(
-            self,
-            max_length: int,
-            pairs: Sequence[LANG_PAIR],
-            input_lang: 'Lang',
-            output_lang: 'Lang',
-            n_iters: int,
-            print_every: int = 1000,
-            plot_every: int = 100,
+        self,
+        max_length: int,
+        pairs: Sequence[LANG_PAIR],
+        input_lang: 'Lang',
+        output_lang: 'Lang',
+        n_iters: int,
+        print_every: int = 1000,
+        plot_every: int = 100
 
     ) -> None:
 
@@ -325,7 +333,7 @@ class TrainContext:
             input_tensor = training_pair[0]
             target_tensor = training_pair[1]
 
-            train_loss_value = self.model.train_new(train_loss_value, input_tensor, target_tensor, max_length)
+            train_loss_value = self.model.train_(train_loss_value, self.optimizer, input_tensor, target_tensor, max_length)
             print_loss_total += train_loss_value
             plot_loss_total += train_loss_value
 
@@ -349,7 +357,7 @@ class EvalContext:
     SOS_token: int
     EOS_token: int
 
-    def get_decoded_words(self, output_lang: 'Lang', decoder: 'DecoderRNN', decoder_hidden: 'Tensor', max_length: int) -> List[str]:
+    def get_decoded_words(self, output_lang: 'Lang', decoder: 'DecoderRNN', decoder_hidden: HIDDEN_TYPE, max_length: int) -> List[str]:
         decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)  # SOS
         decoded_words = []
         for di in range(max_length):
@@ -366,13 +374,13 @@ class EvalContext:
 
 
     def evaluate(
-            self,
-            input_lang: 'Lang',
-            output_lang: 'Lang',
-            encoder: 'EncoderRNN',
-            decoder: 'DecoderRNN',
-            sentence: str,
-            max_length: int
+        self,
+        input_lang: 'Lang',
+        output_lang: 'Lang',
+        encoder: 'EncoderRNN',
+        decoder: 'DecoderRNN',
+        sentence: str,
+        max_length: int
 
     ) -> List[str]:
 
@@ -392,14 +400,14 @@ class EvalContext:
 
 
     def evaluate_randomly(
-            self,
-            max_length: int,
-            pairs: Sequence[LANG_PAIR],
-            input_lang: 'Lang',
-            output_lang: 'Lang',
-            encoder: 'EncoderRNN',
-            decoder: 'DecoderRNN',
-            n: int = 10
+        self,
+        max_length: int,
+        pairs: Sequence[LANG_PAIR],
+        input_lang: 'Lang',
+        output_lang: 'Lang',
+        encoder: 'EncoderRNN',
+        decoder: 'DecoderRNN',
+        n: int = 10
 
     ) -> None:
 
@@ -423,7 +431,7 @@ def main():
     RNN_TYPE = GRU
     MAX_LENGTH = 10
     HIDDEN_SIZE = 256
-    HIDDEN_LAYERS_COUNT = 3
+    HIDDEN_LAYERS_COUNT = 1
 
     ENG_PREFIXES = (
         "i am ", "i m ",
@@ -434,11 +442,18 @@ def main():
         "they are", "they re "
     )
 
+    # # ENG => FRA
+    # FileUtils.load_archive('https://download.pytorch.org/tutorial/data.zip', './')
+    # lang_file_path = './data/eng-fra.txt'
+    # lang_one_name = 'eng'
+    # lang_two_name = 'fra'
 
-    FileUtils.load_archive('https://download.pytorch.org/tutorial/data.zip', './')
-    lang_file_path = './data/eng-fra.txt'
-    lang_one_name = 'eng'
-    lang_two_name = 'fra'
+    # # RUS => ENG
+    FileUtils.load_archive('https://www.manythings.org/anki/rus-eng.zip', './')
+    lang_file_path = './rus.txt'
+    lang_one_name = 'rus'
+    lang_two_name = 'eng'
+
 
     input_lang, output_lang, pairs = Lang.read_langs(lang_file_path, lang_one_name, lang_two_name, True)
     input_lang, output_lang, pairs = PrepareData.prepare_data(input_lang, output_lang, pairs, MAX_LENGTH, ENG_PREFIXES)
@@ -448,9 +463,12 @@ def main():
 
     encoder = EncoderRNN(RNN_TYPE, HIDDEN_SIZE, input_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
     decoder = DecoderRNN(RNN_TYPE, HIDDEN_SIZE, output_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
-    seq2seq = Seq2Seq(LEARNING_RATE, encoder, decoder, SOS_INDEX, EOS_INDEX)
+    loss = NLLLoss()
 
-    train_context = TrainContext(seq2seq)
+    seq2seq = Seq2Seq(encoder, decoder, loss, SOS_INDEX, EOS_INDEX)
+    optimizer = SGD(seq2seq.parameters(), lr=LEARNING_RATE)
+
+    train_context = TrainContext(seq2seq, optimizer)
     train_context.train_model(MAX_LENGTH, pairs, input_lang, output_lang, 75000, print_every=5000)
 
     eval_context = EvalContext(SOS_INDEX, EOS_INDEX)
