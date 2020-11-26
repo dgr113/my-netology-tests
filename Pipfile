@@ -15,6 +15,7 @@ sequential = "*"
 tensorflow = "*"
 mypy = "*"
 requests = "*"
+torchtext = "*"
 
 [requires]
 python_version = "3.8"

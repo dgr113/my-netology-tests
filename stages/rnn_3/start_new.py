@@ -14,8 +14,8 @@ from collections import Counter
 from urllib import request
 from zipfile import ZipFile
 from functools import partial
-from random import random, choice
 from itertools import starmap
+from random import random, choice
 from dataclasses import dataclass, InitVar, field
 from typing import Sequence, Tuple, Union, List, Dict, Type, Callable, Optional, Generator
 
@@ -48,7 +48,7 @@ class TimeMeasure:
     def time_since(cls, since: UNI_NUM_TYPE, percent: UNI_NUM_TYPE) -> str:
         now = time()
         s = now - since
-        es = s / percent
+        es = s / ( percent or 1 )
         rs = es - s
         return "{} (- {})".format(cls.as_minutes(s), cls.as_minutes(rs))
 
@@ -123,13 +123,22 @@ class Lang:
         for word in sentence:
             self._add_word(word)
 
+    @staticmethod
+    def from_data(first_lang: str, second_lang: str, data: Sequence[Tuple[str, str]], splitter: str = ' '):
+        first_lang = Lang(first_lang)
+        second_lang = Lang(second_lang)
+        for x, y in data:
+            first_lang.add_sentence( x.split(splitter) )
+            second_lang.add_sentence( y.split(splitter) )
+        return first_lang, second_lang
+
 
 
 class CustomDataset(Dataset):
     def __init__(
             self,
-            src_lang_name: str,
-            target_lang_name: str,
+            src_lang: 'Lang',
+            target_lang: 'Lang',
             eos_token: int,
             data: Sequence[LANG_WORDS_PAIR],
             *,
@@ -139,14 +148,12 @@ class CustomDataset(Dataset):
         self.transform_X = transform_X
         self.transform_y = transform_y
 
-        self.input_lang: 'Lang' = Lang(src_lang_name)
-        self.output_lang: 'Lang' = Lang(target_lang_name)
         self.eos_token = eos_token
         self.words2int: Dict[str, int] = {}
 
         self._data = data
-        self._X_to_tensor = partial(CustomDataset.get_tensor_data, eos_token, self.input_lang)
-        self._y_to_tensor = partial(CustomDataset.get_tensor_data, eos_token, self.output_lang)
+        self._X_to_tensor = partial(CustomDataset.get_tensor_data, eos_token, src_lang)
+        self._y_to_tensor = partial(CustomDataset.get_tensor_data, eos_token, target_lang)
 
 
     @staticmethod
@@ -156,7 +163,7 @@ class CustomDataset(Dataset):
             filter_func: Optional[Callable] = None,
             words_splitter: str = ' '
 
-    ) -> Generator[LANG_WORDS_PAIR, None, None]:
+    ) -> Generator[Tuple[str, str], None, None]:
 
         buffered_chars = ''
         with open(filename, 'r', encoding='utf-8') as f:
@@ -166,10 +173,9 @@ class CustomDataset(Dataset):
                     words_blocks = full_line.split('\t')
                     if transform_func:
                         words_blocks = list( map(transform_func, words_blocks) )
-
                     # if not filter_func or filter_func(words_blocks):
                     #     print("!!!", words_blocks)
-                    yield words_blocks[0].split(words_splitter), words_blocks[1].split(words_splitter)
+                    yield words_blocks[0], words_blocks[1]
 
 
     @staticmethod
@@ -187,22 +193,13 @@ class CustomDataset(Dataset):
 
 
     def __len__(self) -> int:
-        return len(self._data)
+        return len( self._data )
 
 
     def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
         s = self._data[idx]
-
         X_ = self.transform_X(s) if self.transform_X else s
         y_ = self.transform_y(s) if self.transform_y else s
-
-
-        print("!!!", X_, y_)
-
-
-        self.input_lang.add_sentence( X_ )
-        self.output_lang.add_sentence( y_ )
-
         X = self._X_to_tensor(X_)
         y = self._y_to_tensor(y_)
         return X, y
@@ -295,8 +292,11 @@ class Seq2Seq(Module):
         return train_loss
 
 
-    def train_(self, loss, optimizer, input_tensor: 'Tensor', target_tensor: 'Tensor', max_length: int) -> float:
+    def train_start(self, loss, optimizer, input_tensor: 'Tensor', target_tensor: 'Tensor', max_length: int) -> float:
         encoder_hidden = self.encoder.init_hidden()
+
+        input_tensor = input_tensor.unsqueeze(1)  # Each element in <input_tensor> is an index of the word
+        target_tensor = target_tensor.unsqueeze(1)
 
         optimizer.zero_grad()
 
@@ -310,6 +310,7 @@ class Seq2Seq(Module):
 
         decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)
         decoder_hidden = encoder_hidden
+
         use_teacher_forcing = True if random() < self.teacher_forcing_ratio else False
 
         train_loss = self._train_apply(loss, target_length, target_tensor, decoder_input, decoder_hidden, use_teacher_forcing)
@@ -325,21 +326,24 @@ class TrainContext:
     dataset: InitVar['Dataset']
     max_length: int
     epochs: int
-    batch_size: int
+    max_iters: int  # Max iters in every epoch
+    batch_size: int  # Currently not used
     batch_shuffle: bool
     model: 'Seq2Seq'
     optimizer: 'Optimizer'
 
     hidden_state_predict: bool = False  # use hiddent_state as predicted values
+    print_every: int = 5000
+    plot_every: int = 100
 
     _current_epoch: int = 0
     _epoch_loss: float = 0
     _current_accuracy: float = 0
     _correct_pred_count: int = 0
-    _data: 'DataLoader' = field(init=False)
+    _data: 'Dataset' = field(init=False)
 
     def __post_init__(self, dataset: 'Dataset'):
-        self._data = DataLoader(dataset, batch_size=self.batch_size, shuffle=self.batch_shuffle)
+        self._data = dataset
 
     def __iter__(self):
         return self
@@ -352,28 +356,28 @@ class TrainContext:
         if self._current_epoch < self.epochs:
             self._epoch_start()
 
-            train_loss = 0.0
-            train_passed = 0
-            for X_batch, y_batch in Processing.loader_to_device(self._data):
-                pass
-                # train_loss_value = self.model.train_(train_loss, self.optimizer, X_batch, y_batch, self.max_length)
-                # print_loss_total += train_loss_value
-                # plot_loss_total += train_loss_value
-                # #     if itr % print_every == 0.0:
-                # #         print_loss_avg = print_loss_total / print_every
-                # #         print_loss_total = 0.0
-                # #         time_diff = itr / n_iters
-                # #         print('%s (%d %d%%) %.4f' % (TimeMeasure.time_since(start, time_diff), itr, itr / n_iters * 100, print_loss_avg))
-                # #
-                # #     if itr % plot_every == 0:
-                # #         plot_loss_avg = plot_loss_total / plot_every
-                # #         plot_losses.append(plot_loss_avg)
-                # #         plot_loss_total = 0.0
-                # #
-                # # Visualize.show_plot(plot_losses)
-                # train_passed += 1
+            train_loss_value = 0.0
+            for i, (X_batch, y_batch) in enumerate(self._data):
+                if i < self.max_iters:
+                    train_loss_value = self.model.train_start(train_loss_value, self.optimizer, X_batch, y_batch, self.max_length)
+                    print_loss_total += train_loss_value
+                    plot_loss_total += train_loss_value
 
-            print( "Train loss: {:.3f}".format(train_loss / train_passed or 1) )
+                    if i % self.print_every == 0.0:
+                        print_loss_avg = print_loss_total / self.print_every
+                        print_loss_total = 0.0
+                        time_diff = i / self.max_iters
+                        print('%s (%d %d%%) %.4f' % (TimeMeasure.time_since(start, time_diff), i, i / self.max_iters * 100, print_loss_avg))
+
+                    # if i % self.plot_every == 0:
+                    #     plot_loss_avg = plot_loss_total / self.plot_every
+                    #     plot_losses.append(plot_loss_avg)
+                    #     plot_loss_total = 0.0
+
+                    # Visualize.show_plot(plot_losses)
+                else:
+                    break
+
             return True
         else:
             raise StopIteration
@@ -399,13 +403,14 @@ class Processing:
             dataset: 'Dataset',
             max_length: int,
             epochs: int,
+            max_iters: int,
             batch_size: int,
             batch_shuffle: bool,
             model: 'Seq2Seq',
             optimizer: 'Optimizer',
             hidden_state_predict: bool = False
     ) -> None:
-        for _ in TrainContext(dataset, max_length, epochs, batch_size, batch_shuffle, model, optimizer, hidden_state_predict):
+        for _ in TrainContext(dataset, max_length, epochs, max_iters, batch_size, batch_shuffle, model, optimizer, hidden_state_predict):
             pass
 
     @staticmethod
@@ -485,11 +490,11 @@ class Processing:
 
 
 
-
 def main():
     SOS_INDEX, EOS_INDEX = 0, 1
     LEARNING_RATE = 0.01
-    EPOCHS = 10
+    EPOCHS = 1
+    TRAIN_ITERS = 75000
     BATCH_SIZE = 256
 
     RNN_TYPE = GRU
@@ -521,17 +526,18 @@ def main():
 
     TEXT_TRANSFROM = ( lambda s: PrepareData.normalize_string( s.lower() ) )
     TEXT_FILTER = ( lambda words: words[0].startswith(ENG_PREFIXES) )
-    X_TRANSFORM = ( lambda pair: pair[0] )
-    Y_TRANSFORM = ( lambda pair: pair[1] )
-
-    data = CustomDataset.pairs_generator(lang_file_path, transform_func=TEXT_TRANSFROM, filter_func=TEXT_FILTER)
-    # print(len(list(data)))
-
-    train_dataset = CustomDataset(lang_first_name, lang_second_name, EOS_INDEX, list(data), transform_X=X_TRANSFORM, transform_y=Y_TRANSFORM)
+    X_TRANSFORM = ( lambda pair: pair[0].split(' ') )
+    Y_TRANSFORM = ( lambda pair: pair[1].split(' ') )
 
 
-    input_lang_words_count = len( train_dataset.input_lang.word_counter )
-    output_lang_words_count = len( train_dataset.output_lang.word_counter )
+    data = list( CustomDataset.pairs_generator(lang_file_path, transform_func=TEXT_TRANSFROM, filter_func=TEXT_FILTER) )
+    first_lang, second_lang = Lang.from_data(lang_first_name, lang_second_name, data)
+
+    input_lang_words_count = len( first_lang.word_counter )
+    output_lang_words_count = len( second_lang.word_counter )
+
+    train_dataset = CustomDataset(first_lang, second_lang, EOS_INDEX, data, transform_X=X_TRANSFORM, transform_y=Y_TRANSFORM)
+    # print(input_lang_words_count, output_lang_words_count)  # 9395 4067
 
     encoder = EncoderRNN(RNN_TYPE, HIDDEN_SIZE, input_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
     decoder = DecoderRNN(RNN_TYPE, HIDDEN_SIZE, output_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
@@ -540,20 +546,11 @@ def main():
     seq2seq = Seq2Seq(encoder, decoder, loss, SOS_INDEX, EOS_INDEX)
     optimizer = SGD(seq2seq.parameters(), lr=LEARNING_RATE)
 
-
-
-    for X, y in train_dataset:
-        if X.shape[0] > 2 or y.shape[0] > 2:
-            print(X.shape, y.shape)
-
-
-
-    # Processing.train_model(train_dataset, MAX_LENGTH, EPOCHS, BATCH_SIZE, True, seq2seq, optimizer, False)
-
-
+    Processing.train_model(train_dataset, MAX_LENGTH, EPOCHS, TRAIN_ITERS, BATCH_SIZE, True, seq2seq, optimizer, False)
 
     # eval_context = EvalContext(SOS_INDEX, EOS_INDEX)
     # eval_context.evaluate_randomly(MAX_LENGTH, pairs, input_lang, output_lang,  encoder, decoder)
+
 
 
 
