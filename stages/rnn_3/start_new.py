@@ -6,33 +6,31 @@ import unicodedata
 import matplotlib.pyplot as plt  # type: ignore
 import matplotlib.ticker as ticker  # type: ignore
 
-from io import open
 from time import time
 from math import floor
 from pathlib import Path
-from collections import Counter
+from operator import attrgetter
 from urllib import request
 from zipfile import ZipFile
-from functools import partial
-from itertools import starmap
-from random import random, choice
+from itertools import starmap, islice
+from random import random
 from dataclasses import dataclass, InitVar, field
-from typing import Sequence, Tuple, Union, List, Dict, Type, Callable, Optional, Generator
+from typing import Tuple, Union, List, Type, Generator, Iterator
 
-from torch import Tensor, device, cuda, tensor, long as torch_long, zeros as torch_zeros, no_grad, relu
-from torch.nn import Module, Embedding, Linear, RNNBase, LogSoftmax, NLLLoss, RNN, GRU, LSTM
-from torch.nn.functional import cross_entropy
+from torch import Tensor, device, cuda, tensor, zeros as torch_zeros, relu, no_grad
+from torch.nn import Module, Embedding, Linear, LogSoftmax, NLLLoss, RNN, GRU, LSTM
 from torch.optim import SGD, Optimizer
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from torchtext.data import Dataset, TabularDataset, Field, BucketIterator  # type: ignore
+from torchtext.vocab import Vocab  # type: ignore
 
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )
 
 UNI_PATH_TYPE = Union[Path, str]
 UNI_NUM_TYPE = Union[int, float]
-LANG_PAIR = Tuple[str, str]
 COMMON_RNN_TYPE = Type[Union[RNN, GRU, LSTM]]
 HIDDEN_TYPE = Union[Tensor, Tuple[Tensor, Tensor]]
-LANG_WORDS_PAIR = Tuple[List[str], List[str]]
+
 
 
 
@@ -104,108 +102,6 @@ class PrepareData:
 
 
 
-class Lang:
-    def __init__(self, name: str, sos_ch: str = "SOS", eof_ch: str = "EOS"):
-        self.name = name
-        self.word_counter = Counter([sos_ch, eof_ch])
-        self.word2index: Dict[str, int] = {}
-        self.index2word = { 0: sos_ch, 1: eof_ch }
-        self.n_words = len(self.index2word)  # Count SOS and EOS
-
-    def _add_word(self, word: str) -> None:
-        if word not in self.word_counter:
-            self.word2index[word] = self.n_words
-            self.index2word[self.n_words] = word
-            self.n_words += 1
-        self.word_counter.update([word, ])
-
-    def add_sentence(self, sentence: Sequence[str]) -> None:
-        for word in sentence:
-            self._add_word(word)
-
-    @staticmethod
-    def from_data(first_lang: str, second_lang: str, data: Sequence[Tuple[str, str]], splitter: str = ' '):
-        first_lang = Lang(first_lang)
-        second_lang = Lang(second_lang)
-        for x, y in data:
-            first_lang.add_sentence( x.split(splitter) )
-            second_lang.add_sentence( y.split(splitter) )
-        return first_lang, second_lang
-
-
-
-class CustomDataset(Dataset):
-    def __init__(
-            self,
-            src_lang: 'Lang',
-            target_lang: 'Lang',
-            eos_token: int,
-            data: Sequence[LANG_WORDS_PAIR],
-            *,
-            transform_X: Optional[Callable] = None,
-            transform_y: Optional[Callable] = None
-    ):
-        self.transform_X = transform_X
-        self.transform_y = transform_y
-
-        self.eos_token = eos_token
-        self.words2int: Dict[str, int] = {}
-
-        self._data = data
-        self._X_to_tensor = partial(CustomDataset.get_tensor_data, eos_token, src_lang)
-        self._y_to_tensor = partial(CustomDataset.get_tensor_data, eos_token, target_lang)
-
-
-    @staticmethod
-    def pairs_generator(
-            filename: UNI_PATH_TYPE,
-            transform_func: Optional[Callable] = None,
-            filter_func: Optional[Callable] = None,
-            words_splitter: str = ' '
-
-    ) -> Generator[Tuple[str, str], None, None]:
-
-        buffered_chars = ''
-        with open(filename, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.isspace():
-                    full_line = ( buffered_chars + line.rstrip('\n') )
-                    words_blocks = full_line.split('\t')
-                    if transform_func:
-                        words_blocks = list( map(transform_func, words_blocks) )
-                    # if not filter_func or filter_func(words_blocks):
-                    #     print("!!!", words_blocks)
-                    yield words_blocks[0], words_blocks[1]
-
-
-    @staticmethod
-    def indexes_from_words(lang: 'Lang', words: Sequence[str]) -> List[int]:
-        return [ lang.word2index[word] for word in words ]
-
-
-    @staticmethod
-    def get_tensor_data(eos_token: int, lang: 'Lang', words: Sequence[str], *, as_unsqueeze: bool = False) -> 'Tensor':
-        indexes = CustomDataset.indexes_from_words(lang, words)
-        indexes.append(eos_token)
-        # t = tensor(indexes, dtype=torch_long, device=TORCH_DEVICE).view(-1, 1)
-        t = tensor(indexes, dtype=torch_long, device=TORCH_DEVICE)
-        return t.unsqueeze(0) if as_unsqueeze else t
-
-
-    def __len__(self) -> int:
-        return len( self._data )
-
-
-    def __getitem__(self, idx: int) -> Tuple['Tensor', 'Tensor']:
-        s = self._data[idx]
-        X_ = self.transform_X(s) if self.transform_X else s
-        y_ = self.transform_y(s) if self.transform_y else s
-        X = self._X_to_tensor(X_)
-        y = self._y_to_tensor(y_)
-        return X, y
-
-
-
 class EncoderRNN(Module):
     def __init__(self, rnn_class: COMMON_RNN_TYPE, hidden_size: int, input_size: int, num_layers: int = 1):
         super().__init__()
@@ -265,22 +161,25 @@ class Seq2Seq(Module):
 
 
     def _train_apply(
-            self,
-            train_loss: 'Tensor',
-            target_length: int,
-            target_tensor: 'Tensor',
-            decoder_input: 'Tensor',
-            decoder_hidden: HIDDEN_TYPE,
-            use_teacher_forcing: bool
+        self,
+        train_loss: 'Tensor',
+        target_length: int,
+        target_tensor: 'Tensor',
+        decoder_hidden: HIDDEN_TYPE,
+        use_teacher_forcing: bool
 
     ) -> 'Tensor':
 
+        decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)
+
         if use_teacher_forcing:
+            # Teacher forcing: Feed the target as the next input
             for di in range(target_length):
                 decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
                 train_loss += self.loss(decoder_output, target_tensor[di])
                 decoder_input = target_tensor[di]  # Teacher forcing
         else:
+            # Without teacher forcing: use its own predictions as the next input
             for di in range(target_length):
                 decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
                 topv, topi = decoder_output.topk(1)
@@ -295,25 +194,22 @@ class Seq2Seq(Module):
     def train_start(self, loss, optimizer, input_tensor: 'Tensor', target_tensor: 'Tensor', max_length: int) -> float:
         encoder_hidden = self.encoder.init_hidden()
 
-        input_tensor = input_tensor.unsqueeze(1)  # Each element in <input_tensor> is an index of the word
-        target_tensor = target_tensor.unsqueeze(1)
-
         optimizer.zero_grad()
 
         input_length = input_tensor.size()[0]
         target_length = target_tensor.size()[0]
+
+        # Vector that stores embedded outputs of all words from <input_tensor>
         encoder_outputs = torch_zeros(max_length, self.encoder.hidden_size, device=TORCH_DEVICE)
 
+        # Encoding of each word vector from <input_tensor>
         for ei in range(input_length):
             encoder_output, encoder_hidden = self.encoder(input_tensor[ei], encoder_hidden)
             encoder_outputs[ei] = encoder_output[0, 0]
 
-        decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)
-        decoder_hidden = encoder_hidden
-
         use_teacher_forcing = True if random() < self.teacher_forcing_ratio else False
 
-        train_loss = self._train_apply(loss, target_length, target_tensor, decoder_input, decoder_hidden, use_teacher_forcing)
+        train_loss = self._train_apply(loss, target_length, target_tensor, encoder_hidden, use_teacher_forcing)
         train_loss.backward()
         optimizer.step()
 
@@ -324,10 +220,11 @@ class Seq2Seq(Module):
 @dataclass
 class TrainContext:
     dataset: InitVar['Dataset']
+    x_name: str
+    y_name: str
     max_length: int
     epochs: int
     max_iters: int  # Max iters in every epoch
-    batch_size: int  # Currently not used
     batch_shuffle: bool
     model: 'Seq2Seq'
     optimizer: 'Optimizer'
@@ -340,44 +237,44 @@ class TrainContext:
     _epoch_loss: float = 0
     _current_accuracy: float = 0
     _correct_pred_count: int = 0
-    _data: 'Dataset' = field(init=False)
+    _data: 'Iterator' = field(init=False)
 
     def __post_init__(self, dataset: 'Dataset'):
-        self._data = dataset
+        self._data = map(
+            attrgetter(self.x_name, self.y_name),
+            BucketIterator(dataset, batch_size=1, shuffle=self.batch_shuffle)
+        )
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        start = time()
-        plot_losses = []
-        print_loss_total, plot_loss_total = 0.0, 0.0
-
         if self._current_epoch < self.epochs:
+            start = time()
+            plot_losses = []
+            print_loss_total, plot_loss_total = 0.0, 0.0
             self._epoch_start()
 
             train_loss_value = 0.0
-            for i, (X_batch, y_batch) in enumerate(self._data):
-                if i < self.max_iters:
-                    train_loss_value = self.model.train_start(train_loss_value, self.optimizer, X_batch, y_batch, self.max_length)
-                    print_loss_total += train_loss_value
-                    plot_loss_total += train_loss_value
+            for i, (X_batch, y_batch) in enumerate(islice(self._data, 0, self.max_iters), 1):
+                ### MAX_LENGTH может быть меньше длины X ! ПРОВЕРИТЬ!
+                train_loss_value = self.model.train_start(train_loss_value, self.optimizer, X_batch.to(TORCH_DEVICE), y_batch.to(TORCH_DEVICE), self.max_length)
+                print_loss_total += train_loss_value
+                plot_loss_total += train_loss_value
 
-                    if i % self.print_every == 0.0:
-                        print_loss_avg = print_loss_total / self.print_every
-                        print_loss_total = 0.0
-                        time_diff = i / self.max_iters
-                        print('%s (%d %d%%) %.4f' % (TimeMeasure.time_since(start, time_diff), i, i / self.max_iters * 100, print_loss_avg))
+                if i % self.print_every == 0.0:
+                    print_loss_avg = print_loss_total / self.print_every
+                    print_loss_total = 0.0
+                    time_diff = i / self.max_iters
+                    time_diff_percent = time_diff * 100
+                    print('%s (%d %d%%) %.4f' % (TimeMeasure.time_since(start, time_diff), i, time_diff_percent, print_loss_avg))
 
-                    # if i % self.plot_every == 0:
-                    #     plot_loss_avg = plot_loss_total / self.plot_every
-                    #     plot_losses.append(plot_loss_avg)
-                    #     plot_loss_total = 0.0
+                if i % self.plot_every == 0:
+                    plot_loss_avg = plot_loss_total / self.plot_every
+                    plot_losses.append( plot_loss_avg )
+                    plot_loss_total = 0.0
 
-                    # Visualize.show_plot(plot_losses)
-                else:
-                    break
-
+            Visualize.show_plot(plot_losses)
             return True
         else:
             raise StopIteration
@@ -400,17 +297,18 @@ class Processing:
 
     @staticmethod
     def train_model(
-            dataset: 'Dataset',
-            max_length: int,
-            epochs: int,
-            max_iters: int,
-            batch_size: int,
-            batch_shuffle: bool,
-            model: 'Seq2Seq',
-            optimizer: 'Optimizer',
-            hidden_state_predict: bool = False
+        dataset: 'Dataset',
+        x_name: str,
+        y_name: str,
+        max_length: int,
+        epochs: int,
+        max_iters: int,
+        batch_shuffle: bool,
+        model: 'Seq2Seq',
+        optimizer: 'Optimizer',
+        hidden_state_predict: bool = False
     ) -> None:
-        for _ in TrainContext(dataset, max_length, epochs, max_iters, batch_size, batch_shuffle, model, optimizer, hidden_state_predict):
+        for _ in TrainContext(dataset, x_name, y_name, max_length, epochs, max_iters, batch_shuffle, model, optimizer, hidden_state_predict):
             pass
 
     @staticmethod
@@ -419,73 +317,77 @@ class Processing:
 
 
 
-# @dataclass
-# class EvalContext:
-#     SOS_token: int
-#     EOS_token: int
-#
-#     def get_decoded_words(self, output_lang: 'Lang', decoder: 'DecoderRNN', decoder_hidden: HIDDEN_TYPE, max_length: int) -> List[str]:
-#         decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)  # SOS
-#         decoded_words = []
-#         for di in range(max_length):
-#             decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-#             topv, topi = decoder_output.data.topk(1)
-#             if topi.item() == self.EOS_token:
-#                 decoded_words.append('<EOS>')
-#                 break
-#             else:
-#                 decoded_words.append(output_lang.index2word[topi.item()])
-#
-#             decoder_input = topi.squeeze().detach()
-#         return decoded_words
-#
-#
-#     def evaluate(
-#         self,
-#         input_lang: 'Lang',
-#         output_lang: 'Lang',
-#         encoder: 'EncoderRNN',
-#         decoder: 'DecoderRNN',
-#         sentence: str,
-#         max_length: int
-#
-#     ) -> List[str]:
-#
-#         with no_grad():
-#             input_tensor = ConvertFrom.tensor_from_sentence(input_lang, sentence, self.EOS_token)
-#             input_length = input_tensor.size()[0]
-#             encoder_hidden = encoder.init_hidden()
-#
-#             encoder_outputs = torch_zeros(max_length, encoder.hidden_size, device=TORCH_DEVICE)
-#
-#             for ei in range(input_length):
-#                 encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
-#                 encoder_outputs[ei] += encoder_output[0, 0]
-#
-#             decoded_words = self.get_decoded_words(output_lang, decoder, encoder_hidden, max_length)
-#             return decoded_words
-#
-#
-#     def evaluate_randomly(
-#         self,
-#         max_length: int,
-#         pairs: Sequence[LANG_PAIR],
-#         input_lang: 'Lang',
-#         output_lang: 'Lang',
-#         encoder: 'EncoderRNN',
-#         decoder: 'DecoderRNN',
-#         n: int = 10
-#
-#     ) -> None:
-#
-#         for i in range(n):
-#             pair = choice(pairs)
-#             print('>', pair[0])
-#             print('=', pair[1])
-#             output_words = self.evaluate(input_lang, output_lang, encoder, decoder, pair[0], max_length)
-#             output_sentence = ' '.join(output_words)
-#             print('<', output_sentence)
-#             print('')
+@dataclass
+class EvalContext:
+    SOS_token: int
+    EOS_token: int
+
+    def get_decoded_words(self, decoder: 'DecoderRNN', output_vocab: 'Vocab', decoder_hidden: HIDDEN_TYPE, max_length: int) -> List[str]:
+        decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)  # SOS
+        decoded_words = []
+        for di in range(max_length):
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+            topv, topi = decoder_output.data.topk(1)
+            topi_value = topi.item()  # Top index of word value
+            if topi_value == self.EOS_token:
+                decoded_words.append('<EOS>')
+                break
+            else:
+                decoded_words.append( output_vocab.itos[topi_value] )
+
+            decoder_input = topi.squeeze().detach()
+        return decoded_words
+
+
+    def evaluate(
+        self,
+        encoder: 'EncoderRNN',
+        decoder: 'DecoderRNN',
+        input_lang: Tuple[str, 'Field'],
+        output_lang: Tuple[str, 'Field'],
+        sentence: str,
+        max_length: int
+
+    ) -> List[str]:
+
+        input_lang_name, input_lang_field = input_lang
+        output_lang_name, output_lang_field = output_lang
+
+        with no_grad():
+            input_tensor = input_lang_field.process(sentence)  ### Проверить <EOS_token> !
+            input_length = input_tensor.size()[0]
+            encoder_hidden = encoder.init_hidden()
+            encoder_outputs = torch_zeros(max_length, encoder.hidden_size, device=TORCH_DEVICE)
+
+            for ei in range(input_length):
+                encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+                encoder_outputs[ei] += encoder_output[0, 0]
+
+            decoded_words = self.get_decoded_words(decoder, output_lang_field.vocab, encoder_hidden, max_length)
+            return decoded_words
+
+
+    def evaluate_randomly(
+        self,
+        max_length: int,
+        dataset: 'Dataset',
+        input_lang: Tuple[str, 'Field'],
+        output_lang: Tuple[str, 'Field'],
+        encoder: 'EncoderRNN',
+        decoder: 'DecoderRNN',
+
+    ) -> None:
+
+        input_lang_name, input_lang_field = input_lang
+        output_lang_name, output_lang_field = output_lang
+
+        for X, y in map(attrgetter(input_lang_name, output_lang_name), dataset):
+            print('>', X)
+            print('=', y)
+            output_words = self.evaluate(encoder, decoder, input_lang, output_lang, X, max_length)
+            output_sentence = ' '.join(output_words)
+            print('<', output_sentence)
+            print('')
 
 
 
@@ -495,7 +397,6 @@ def main():
     LEARNING_RATE = 0.01
     EPOCHS = 1
     TRAIN_ITERS = 75000
-    BATCH_SIZE = 256
 
     RNN_TYPE = GRU
     MAX_LENGTH = 10
@@ -524,35 +425,26 @@ def main():
     lang_second_name = 'eng'
 
 
-    TEXT_TRANSFROM = ( lambda s: PrepareData.normalize_string( s.lower() ) )
-    TEXT_FILTER = ( lambda words: words[0].startswith(ENG_PREFIXES) )
-    X_TRANSFORM = ( lambda pair: pair[0].split(' ') )
-    Y_TRANSFORM = ( lambda pair: pair[1].split(' ') )
+    first_lang = Field(lang_first_name, init_token='SOS', eos_token='EOS', lower=True, fix_length=MAX_LENGTH, tokenize=( lambda s: PrepareData.normalize_string(s).split(' ') ))
+    second_lang = Field(lang_second_name, init_token='SOS', eos_token='EOS', lower=True, fix_length=MAX_LENGTH, tokenize=( lambda s: PrepareData.normalize_string(s).split(' ') ))
+    first_lang_attr = (lang_first_name, first_lang)
+    second_lang_attr = (lang_second_name, second_lang)
 
+    dataset = TabularDataset(path=lang_file_path, format='tsv', fields=[first_lang_attr, second_lang_attr], filter_pred=None)
+    first_lang.build_vocab(dataset, max_size=400)
+    second_lang.build_vocab(dataset, max_size=800)
 
-    data = list( CustomDataset.pairs_generator(lang_file_path, transform_func=TEXT_TRANSFROM, filter_func=TEXT_FILTER) )
-    first_lang, second_lang = Lang.from_data(lang_first_name, lang_second_name, data)
+    test_dataset, train_dataset = dataset.split(0.0001)
 
-    input_lang_words_count = len( first_lang.word_counter )
-    output_lang_words_count = len( second_lang.word_counter )
-
-    train_dataset = CustomDataset(first_lang, second_lang, EOS_INDEX, data, transform_X=X_TRANSFORM, transform_y=Y_TRANSFORM)
-    # print(input_lang_words_count, output_lang_words_count)  # 9395 4067
-
-    encoder = EncoderRNN(RNN_TYPE, HIDDEN_SIZE, input_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
-    decoder = DecoderRNN(RNN_TYPE, HIDDEN_SIZE, output_lang_words_count, HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
+    encoder = EncoderRNN(RNN_TYPE, HIDDEN_SIZE, len( first_lang.vocab ), HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
+    decoder = DecoderRNN(RNN_TYPE, HIDDEN_SIZE, len( second_lang.vocab ), HIDDEN_LAYERS_COUNT).to(TORCH_DEVICE)
     loss = NLLLoss()
 
     seq2seq = Seq2Seq(encoder, decoder, loss, SOS_INDEX, EOS_INDEX)
     optimizer = SGD(seq2seq.parameters(), lr=LEARNING_RATE)
 
-    Processing.train_model(train_dataset, MAX_LENGTH, EPOCHS, TRAIN_ITERS, BATCH_SIZE, True, seq2seq, optimizer, False)
+
+    Processing.train_model(train_dataset, lang_first_name, lang_second_name, MAX_LENGTH, EPOCHS, TRAIN_ITERS, True, seq2seq, optimizer)
 
     # eval_context = EvalContext(SOS_INDEX, EOS_INDEX)
-    # eval_context.evaluate_randomly(MAX_LENGTH, pairs, input_lang, output_lang,  encoder, decoder)
-
-
-
-
-if __name__ == '__main__':
-    main()
+    # eval_context.evaluate_randomly(MAX_LENGTH, test_dataset, first_lang_attr, second_lang_attr, encoder, decoder)
