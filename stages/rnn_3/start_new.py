@@ -9,19 +9,20 @@ import matplotlib.ticker as ticker  # type: ignore
 from time import time
 from math import floor
 from pathlib import Path
+from functools import partial
 from operator import attrgetter
 from urllib import request
 from zipfile import ZipFile
 from itertools import starmap, islice
 from random import random
 from dataclasses import dataclass, InitVar, field
-from typing import Tuple, Union, List, Type, Generator, Iterator
+from typing import Tuple, Union, List, Type, Generator, Iterator, Optional
 
 from torch import Tensor, device, cuda, tensor, zeros as torch_zeros, relu, no_grad
 from torch.nn import Module, Embedding, Linear, LogSoftmax, NLLLoss, RNN, GRU, LSTM
 from torch.optim import SGD, Optimizer
 from torch.utils.data import DataLoader
-from torchtext.data import Dataset, TabularDataset, Field, BucketIterator  # type: ignore
+from torchtext.data import Dataset, TabularDataset, Field, BucketIterator, Example  # type: ignore
 from torchtext.vocab import Vocab  # type: ignore
 
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )
@@ -30,7 +31,6 @@ UNI_PATH_TYPE = Union[Path, str]
 UNI_NUM_TYPE = Union[int, float]
 COMMON_RNN_TYPE = Type[Union[RNN, GRU, LSTM]]
 HIDDEN_TYPE = Union[Tensor, Tuple[Tensor, Tensor]]
-
 
 
 
@@ -99,6 +99,12 @@ class PrepareData:
         s = re.sub(r"([.!?])", r" \1", s)
         s = re.sub(r"[^0-9a-zA-Zа-яА-Я.!?]+", r" ", s)
         return s
+
+    @staticmethod
+    def filter_dataset(first_lang_name: str, second_lang_name: str, data_example: 'Example', *, max_length: Optional[int] = None) -> bool:
+        p_0, p_1 = getattr(data_example, first_lang_name), getattr(data_example, second_lang_name)
+        len_check_result = all( ln < max_length for ln in map(len, (p_0, p_1)) ) if max_length else True
+        return len_check_result
 
 
 
@@ -257,7 +263,6 @@ class TrainContext:
 
             train_loss_value = 0.0
             for i, (X_batch, y_batch) in enumerate(islice(self._data, 0, self.max_iters), 1):
-                ### MAX_LENGTH может быть меньше длины X ! ПРОВЕРИТЬ!
                 train_loss_value = self.model.train_start(train_loss_value, self.optimizer, X_batch.to(TORCH_DEVICE), y_batch.to(TORCH_DEVICE), self.max_length)
                 print_loss_total += train_loss_value
                 plot_loss_total += train_loss_value
@@ -374,7 +379,7 @@ class EvalContext:
         input_lang: Tuple[str, 'Field'],
         output_lang: Tuple[str, 'Field'],
         encoder: 'EncoderRNN',
-        decoder: 'DecoderRNN',
+        decoder: 'DecoderRNN'
 
     ) -> None:
 
@@ -425,12 +430,14 @@ def main():
     lang_second_name = 'eng'
 
 
+    dataset_filter_func = partial(PrepareData.filter_dataset, lang_first_name, lang_second_name, max_length=MAX_LENGTH)
+
     first_lang = Field(lang_first_name, init_token='SOS', eos_token='EOS', lower=True, fix_length=MAX_LENGTH, tokenize=( lambda s: PrepareData.normalize_string(s).split(' ') ))
     second_lang = Field(lang_second_name, init_token='SOS', eos_token='EOS', lower=True, fix_length=MAX_LENGTH, tokenize=( lambda s: PrepareData.normalize_string(s).split(' ') ))
     first_lang_attr = (lang_first_name, first_lang)
     second_lang_attr = (lang_second_name, second_lang)
 
-    dataset = TabularDataset(path=lang_file_path, format='tsv', fields=[first_lang_attr, second_lang_attr], filter_pred=None)
+    dataset = TabularDataset(path=lang_file_path, format='tsv', fields=[first_lang_attr, second_lang_attr], filter_pred=dataset_filter_func)
     first_lang.build_vocab(dataset, max_size=400)
     second_lang.build_vocab(dataset, max_size=800)
 
@@ -448,3 +455,9 @@ def main():
 
     # eval_context = EvalContext(SOS_INDEX, EOS_INDEX)
     # eval_context.evaluate_randomly(MAX_LENGTH, test_dataset, first_lang_attr, second_lang_attr, encoder, decoder)
+
+
+
+
+if __name__ == '__main__':
+    main()
