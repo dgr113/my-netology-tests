@@ -16,14 +16,13 @@ from zipfile import ZipFile
 from itertools import starmap, islice
 from random import random
 from dataclasses import dataclass, InitVar, field
-from typing import Tuple, Union, List, Type, Generator, Iterator, Optional
+from typing import Tuple, Union, List, Type, Generator, Sequence, Iterator, Optional
 
 from torch import Tensor, device, cuda, tensor, zeros as torch_zeros, relu, no_grad
 from torch.nn import Module, Embedding, Linear, LogSoftmax, NLLLoss, RNN, GRU, LSTM
 from torch.optim import SGD, Optimizer
 from torch.utils.data import DataLoader
 from torchtext.data import Dataset, TabularDataset, Field, BucketIterator, Example  # type: ignore
-from torchtext.vocab import Vocab  # type: ignore
 
 TORCH_DEVICE = device( 'cuda' if cuda.is_available() else 'cpu' )
 
@@ -86,7 +85,7 @@ class FileUtils:
 
 class PrepareData:
     @staticmethod
-    def unicode_to_ascii(s: str) -> str:
+    def _unicode_to_ascii(s: str) -> str:
         """ Turn a Unicode string to plain ASCII ( http://stackoverflow.com/a/518232/2809427 ) """
         return ''.join(
             c for c in unicodedata.normalize('NFD', s)
@@ -94,11 +93,11 @@ class PrepareData:
         )
 
     @classmethod
-    def normalize_string(cls, s: str) -> str:
-        s = cls.unicode_to_ascii( s.lower().strip() )
+    def normalize_string(cls, s: str, *, as_tokens: bool = True, splitter: str = ' ') -> Union[str, Sequence[str]]:
+        s = cls._unicode_to_ascii( s.lower().strip() )
         s = re.sub(r"([.!?])", r" \1", s)
         s = re.sub(r"[^0-9a-zA-Zа-яА-Я.!?]+", r" ", s)
-        return s
+        return s.split(splitter) if as_tokens else s
 
     @staticmethod
     def filter_dataset(first_lang_name: str, second_lang_name: str, data_example: 'Example', *, max_length: Optional[int] = None) -> bool:
@@ -316,36 +315,33 @@ class Processing:
         for _ in TrainContext(dataset, x_name, y_name, max_length, epochs, max_iters, batch_shuffle, model, optimizer, hidden_state_predict):
             pass
 
-    @staticmethod
-    def predict():
-        pass
-
 
 
 @dataclass
 class EvalContext:
-    SOS_token: int
-    EOS_token: int
+    @staticmethod
+    def _get_decoded_words(decoder: 'DecoderRNN', output_lang_field: 'Field', decoder_hidden: HIDDEN_TYPE, max_length: int) -> List[str]:
+        SOS_token = output_lang_field.vocab.stoi[output_lang_field.init_token]
+        EOS_token = output_lang_field.vocab.stoi[output_lang_field.eos_token]
 
-    def get_decoded_words(self, decoder: 'DecoderRNN', output_vocab: 'Vocab', decoder_hidden: HIDDEN_TYPE, max_length: int) -> List[str]:
-        decoder_input = tensor([[self.SOS_token]], device=TORCH_DEVICE)  # SOS
+        decoder_input = tensor([[SOS_token]], device=TORCH_DEVICE)
         decoded_words = []
         for di in range(max_length):
             decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
             topv, topi = decoder_output.data.topk(1)
             topi_value = topi.item()  # Top index of word value
-            if topi_value == self.EOS_token:
-                decoded_words.append('<EOS>')
+
+            if topi_value == EOS_token:
+                decoded_words.append('EOS')
                 break
             else:
-                decoded_words.append( output_vocab.itos[topi_value] )
+                decoded_words.append( output_lang_field.vocab.itos[topi_value] )
 
             decoder_input = topi.squeeze().detach()
         return decoded_words
 
-
-    def evaluate(
-        self,
+    @staticmethod
+    def evaluate_apply(
         encoder: 'EncoderRNN',
         decoder: 'DecoderRNN',
         input_lang: Tuple[str, 'Field'],
@@ -359,7 +355,7 @@ class EvalContext:
         output_lang_name, output_lang_field = output_lang
 
         with no_grad():
-            input_tensor = input_lang_field.process(sentence)  ### Проверить <EOS_token> !
+            input_tensor = input_lang_field.process([sentence, ]).to(TORCH_DEVICE)
             input_length = input_tensor.size()[0]
             encoder_hidden = encoder.init_hidden()
             encoder_outputs = torch_zeros(max_length, encoder.hidden_size, device=TORCH_DEVICE)
@@ -368,28 +364,28 @@ class EvalContext:
                 encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
                 encoder_outputs[ei] += encoder_output[0, 0]
 
-            decoded_words = self.get_decoded_words(decoder, output_lang_field.vocab, encoder_hidden, max_length)
+            decoded_words = EvalContext._get_decoded_words(decoder, output_lang_field, encoder_hidden, max_length)
             return decoded_words
 
-
+    @staticmethod
     def evaluate_randomly(
-        self,
         max_length: int,
         dataset: 'Dataset',
         input_lang: Tuple[str, 'Field'],
         output_lang: Tuple[str, 'Field'],
         encoder: 'EncoderRNN',
-        decoder: 'DecoderRNN'
+        decoder: 'DecoderRNN',
 
     ) -> None:
 
         input_lang_name, input_lang_field = input_lang
         output_lang_name, output_lang_field = output_lang
 
-        for X, y in map(attrgetter(input_lang_name, output_lang_name), dataset):
-            print('>', X)
-            print('=', y)
-            output_words = self.evaluate(encoder, decoder, input_lang, output_lang, X, max_length)
+        for src, trg in map(attrgetter(input_lang_name, output_lang_name), dataset):
+            src_str, trg_str = map(' '.join, [src, trg])
+            print('>', src_str)
+            print('=', trg_str)
+            output_words = EvalContext.evaluate_apply(encoder, decoder, input_lang, output_lang, src, max_length)
             output_sentence = ' '.join(output_words)
             print('<', output_sentence)
             print('')
@@ -408,21 +404,6 @@ def main():
     HIDDEN_SIZE = 256
     HIDDEN_LAYERS_COUNT = 1
 
-    ENG_PREFIXES = (
-        "i am ", "i m ",
-        "he is", "he s ",
-        "she is", "she s",
-        "you are", "you re ",
-        "we are", "we re ",
-        "they are", "they re "
-    )
-
-    # # ENG => FRA
-    # FileUtils.load_archive('https://download.pytorch.org/tutorial/data.zip', './')
-    # lang_file_path = './data/eng-fra.txt'
-    # lang_first_name = 'eng'
-    # lang_second_name = 'fra'
-
     # # RUS => ENG
     FileUtils.load_archive('https://www.manythings.org/anki/rus-eng.zip', './')
     lang_file_path = './rus.txt'
@@ -432,8 +413,8 @@ def main():
 
     dataset_filter_func = partial(PrepareData.filter_dataset, lang_first_name, lang_second_name, max_length=MAX_LENGTH)
 
-    first_lang = Field(lang_first_name, init_token='SOS', eos_token='EOS', lower=True, fix_length=MAX_LENGTH, tokenize=( lambda s: PrepareData.normalize_string(s).split(' ') ))
-    second_lang = Field(lang_second_name, init_token='SOS', eos_token='EOS', lower=True, fix_length=MAX_LENGTH, tokenize=( lambda s: PrepareData.normalize_string(s).split(' ') ))
+    first_lang = Field(lang_first_name, init_token='SOS', eos_token='EOS', fix_length=MAX_LENGTH, lower=True, tokenize=PrepareData.normalize_string)
+    second_lang = Field(lang_second_name, init_token='SOS', eos_token='EOS', fix_length=MAX_LENGTH, lower=True, tokenize=PrepareData.normalize_string)
     first_lang_attr = (lang_first_name, first_lang)
     second_lang_attr = (lang_second_name, second_lang)
 
@@ -452,10 +433,7 @@ def main():
 
 
     Processing.train_model(train_dataset, lang_first_name, lang_second_name, MAX_LENGTH, EPOCHS, TRAIN_ITERS, True, seq2seq, optimizer)
-
-    # eval_context = EvalContext(SOS_INDEX, EOS_INDEX)
-    # eval_context.evaluate_randomly(MAX_LENGTH, test_dataset, first_lang_attr, second_lang_attr, encoder, decoder)
-
+    EvalContext.evaluate_randomly(MAX_LENGTH, test_dataset, first_lang_attr, second_lang_attr, encoder, decoder)
 
 
 
